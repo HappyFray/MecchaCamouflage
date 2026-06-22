@@ -192,6 +192,24 @@ namespace MecchaCamouflage::Diagnostics
                 out << "  \"bulk_runner_up_median\": " << data.bulk_runner_up_median << ",\n";
                 out << "  \"capture_trace_chroma_avg\": " << data.capture_trace_chroma_avg << ",\n";
                 out << "  \"capture_trace_chroma_p95\": " << data.capture_trace_chroma_p95 << ",\n";
+                out << "  \"phase_ms\": {\n";
+                out << "    \"hit\": " << data.phase_hit_ms << ",\n";
+                out << "    \"trace\": " << data.phase_trace_ms << ",\n";
+                out << "    \"capture\": " << data.phase_capture_ms << ",\n";
+                out << "    \"export\": " << data.phase_export_ms << ",\n";
+                out << "    \"seed\": " << data.phase_seed_ms << ",\n";
+                out << "    \"side\": " << data.phase_side_ms << ",\n";
+                out << "    \"atlas\": " << data.phase_atlas_ms << ",\n";
+                out << "    \"import\": " << data.phase_import_ms << "\n";
+                out << "  },\n";
+                out << "  \"low_luma_suspect\": " << (data.low_luma_suspect ? "true" : "false") << ",\n";
+                out << "  \"chroma_validation_failed\": " << (data.chroma_validation_failed ? "true" : "false") << ",\n";
+                out << "  \"material_confidence\": ";
+                write_json_string(out, data.material_confidence);
+                out << ",\n";
+                out << "  \"material_source\": ";
+                write_json_string(out, data.material_source);
+                out << ",\n";
                 out << "  \"bulk_calibration_candidates\": [";
                 for (std::size_t i = 0; i < data.bulk_calibration_candidates.size(); ++i)
                 {
@@ -241,6 +259,14 @@ namespace MecchaCamouflage::Diagnostics
         if (data.target_albedo)
         {
             write_albedo_ppm(dir / "target_albedo.ppm", *data.target_albedo);
+        }
+        if (data.target_metallic)
+        {
+            write_albedo_ppm(dir / "target_metallic.ppm", *data.target_metallic);
+        }
+        if (data.target_roughness)
+        {
+            write_albedo_ppm(dir / "target_roughness.ppm", *data.target_roughness);
         }
 
         return dir.string();

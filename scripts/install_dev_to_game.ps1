@@ -18,9 +18,19 @@ if (-not $Dll) {
     throw "MecchaCamouflage.dll was not found under $BuildDir. Run scripts\build_dev.ps1 first."
 }
 
-$ModsRoot = Join-Path $GameRoot "Chameleon\Binaries\Win64\ue4ss\Mods"
-if (-not (Test-Path $ModsRoot)) {
-    throw "UE4SS Mods folder was not found: $ModsRoot"
+$ModsRootCandidates = @(
+    (Join-Path $GameRoot "Chameleon\Binaries\Win64\ue4ss\Mods"),
+    (Join-Path $GameRoot "Chameleon\Binaries\Win64\Mods")
+)
+$ModsRoot = ""
+foreach ($Candidate in $ModsRootCandidates) {
+    if (Test-Path $Candidate) {
+        $ModsRoot = $Candidate
+        break
+    }
+}
+if (-not $ModsRoot) {
+    throw "UE4SS Mods folder was not found. Checked: $($ModsRootCandidates -join '; ')"
 }
 
 $DllDir = Join-Path $ModsRoot "$ModName\dlls"
@@ -33,7 +43,24 @@ try {
     $Installed = $false
     $PendingDll = Join-Path $DllDir "main.pending.dll"
     Copy-Item -Force $Dll.FullName $PendingDll
-    Write-Warning "Could not replace $TargetDll because it is in use. Close the game and run this script again. Staged new DLL at $PendingDll"
+    $WatcherScript = Join-Path $RepoRoot "scripts\replace_pending_when_unlocked.ps1"
+    if (Test-Path $WatcherScript) {
+        $Quote = {
+            param([string]$Value)
+            '"' + ($Value -replace '"', '\"') + '"'
+        }
+        $Arguments = @(
+            "-NoProfile",
+            "-ExecutionPolicy Bypass",
+            "-File $(& $Quote $WatcherScript)",
+            "-TargetDll $(& $Quote $TargetDll)",
+            "-PendingDll $(& $Quote $PendingDll)"
+        ) -join " "
+        Start-Process -WindowStyle Hidden -FilePath "powershell.exe" -ArgumentList $Arguments | Out-Null
+        Write-Warning "Could not replace $TargetDll because it is in use. Staged new DLL at $PendingDll and started a watcher to replace it when the game exits."
+    } else {
+        Write-Warning "Could not replace $TargetDll because it is in use. Close the game and run this script again. Staged new DLL at $PendingDll"
+    }
 }
 
 $ModsTxt = Join-Path $ModsRoot "mods.txt"

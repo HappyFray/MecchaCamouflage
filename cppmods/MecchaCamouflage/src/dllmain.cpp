@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -22,6 +23,7 @@
 #include <Input/KeyDef.hpp>
 #include <Mod/CppUserModBase.hpp>
 #include <String/StringType.hpp>
+#include <UE4SSProgram.hpp>
 #include <Unreal/AActor.hpp>
 #include <Unreal/Core/Containers/ScriptArray.hpp>
 #include <Unreal/Core/Containers/FString.hpp>
@@ -38,10 +40,15 @@
 #include <Unreal/UnrealFlags.hpp>
 #include <Unreal/World.hpp>
 #include <UnrealDef.hpp>
+#include <imgui.h>
 
 #include "MecchaCamouflage/core/paint_core.hpp"
 #include "MecchaCamouflage/diagnostics/artifact_writer.hpp"
 #include "MecchaCamouflage/diagnostics/status_writer.hpp"
+
+#ifndef MECCHA_CAMOUFLAGE_DIAGNOSTICS
+#define MECCHA_CAMOUFLAGE_DIAGNOSTICS 0
+#endif
 
 namespace
 {
@@ -53,13 +60,13 @@ namespace
     constexpr double Pi = 3.14159265358979323846;
     constexpr int PaintChannelAlbedoMetallicRoughness = 5;
     constexpr int PaintChannelUnknown = -1;
-    constexpr int ProjectionCaptureResolution = 1024;
     constexpr int ScreenProjectionGridX = 54;
     constexpr int ScreenProjectionGridY = 30;
     constexpr int MinQualityScreenHitUvSamples = 2048;
     constexpr int PixelAlignmentSampleLimit = 96;
     constexpr int SceneCaptureRenderTargetFormatRgba16f = 6;
     constexpr int SceneCaptureSourceFinalColorLdr = 2;
+    constexpr bool DiagnosticsEnabled = MECCHA_CAMOUFLAGE_DIAGNOSTICS != 0;
 
     struct Color
     {
@@ -174,6 +181,9 @@ namespace
         StringType array_param{};
         StringType inner_type{};
         StringType bool_variant{};
+        StringType function_path{};
+        bool write_color_bool{false};
+        bool color_bool_value{false};
         StringType color_transform_backend{STR("identity")};
         StringType failure{STR("not_run")};
         ScreenTransform bulk_to_pixel_transform{};
@@ -259,6 +269,8 @@ namespace
         int channel_attempts{0};
         int self_skips{0};
         bool floor_like{false};
+        bool has_roughness_scalar{false};
+        bool has_metallic_scalar{false};
     };
 
     struct ProjectedCaptureCoordStats
@@ -348,6 +360,7 @@ namespace
         Unreal::FVector min_world{};
         Unreal::FVector max_world{};
         bool has_world_bounds{false};
+        bool budget_exhausted{false};
         StringType first_failure{};
     };
 
@@ -380,9 +393,31 @@ namespace
         int normal_suspect{0};
         int out_of_view{0};
         int no_color{0};
+        bool budget_exhausted{false};
         StringType first_failure{};
         StringType query_name{};
     };
+
+    struct DeferredRefinedHitCache
+    {
+        bool valid{false};
+        StringType pawn_name{};
+        StringType component_name{};
+        std::vector<ScreenHitSample> samples{};
+        ScreenHitCollectionStats stats{};
+    };
+
+    DeferredRefinedHitCache g_deferred_refined_hit_cache{};
+
+    struct CachedReadbackBackend
+    {
+        bool valid{false};
+        StringType function_path{};
+        bool write_color_bool{false};
+        bool color_bool_value{false};
+    };
+
+    CachedReadbackBackend g_readback_backend_cache{};
 
     struct ProbeState
     {
@@ -432,6 +467,7 @@ namespace
         int side_nearest_sources{0};
         int side_duplicate_texels{0};
         int side_normal_suspect{0};
+        int side_budget_exhausted{0};
         uint64_t paint_state_hash_before{0};
         uint64_t paint_state_hash_after{0};
         uint64_t play_id{0};
@@ -502,8 +538,12 @@ namespace
     auto is_floor_like_object(Unreal::UObject* actor, Unreal::UObject* component) -> bool;
     auto transform_screen_coord(double value, double scale, double offset, bool flip, double pivot) -> double;
     auto effective_capture_coord(double capture_value, double fallback_value) -> double;
+    auto read_bool(Unreal::FProperty* property, uint8_t* container) -> bool;
+    auto read_object(Unreal::FProperty* property, uint8_t* container) -> Unreal::UObject*;
+    auto read_number(Unreal::FProperty* property, uint8_t* container) -> std::optional<double>;
     auto read_bool_property_by_name(Unreal::UObject* object, const CharType* property_name) -> std::optional<bool>;
     auto write_bool_property_by_name(Unreal::UObject* object, const CharType* property_name, bool value) -> bool;
+    auto call_no_params_return_object(Unreal::UObject* object, const CharType* function_name) -> Unreal::UObject*;
     auto call_bool_params(Unreal::UObject* object, const CharType* function_name, std::initializer_list<bool> values) -> bool;
     auto call_rotator_bool_params(Unreal::UObject* object,
                                   const CharType* function_name,
@@ -642,20 +682,6 @@ namespace
         return std::sqrt(dr * dr + dg * dg + db * db);
     }
 
-    auto chroma_distance_rgb(const Color& a, const Color& b) -> double
-    {
-        const auto normalize = [](const Color& color) {
-            const auto sum = std::max(0.000001, color.r + color.g + color.b);
-            return std::array<double, 3>{color.r / sum, color.g / sum, color.b / sum};
-        };
-        const auto ca = normalize(a);
-        const auto cb = normalize(b);
-        const auto dr = ca[0] - cb[0];
-        const auto dg = ca[1] - cb[1];
-        const auto db = ca[2] - cb[2];
-        return std::sqrt(dr * dr + dg * dg + db * db);
-    }
-
     auto median_value(std::vector<double> values) -> double
     {
         if (values.empty())
@@ -740,6 +766,32 @@ namespace
             out.push_back(value >= 32 && value <= 126 ? static_cast<char>(value) : '?');
         }
         return out;
+    }
+
+    auto leaf_label(StringType text) -> StringType
+    {
+        const auto space = text.find(static_cast<CharType>(' '));
+        if (space != StringType::npos && space + 1 < text.size())
+        {
+            text = text.substr(space + 1);
+        }
+        for (auto index = text.size(); index > 0; --index)
+        {
+            const auto ch = text[index - 1];
+            if (ch == static_cast<CharType>('.') ||
+                ch == static_cast<CharType>('/') ||
+                ch == static_cast<CharType>('\\') ||
+                ch == static_cast<CharType>(':'))
+            {
+                return text.substr(index);
+            }
+        }
+        return text;
+    }
+
+    auto surface_leaf_label(Unreal::UObject* actor, Unreal::UObject* component) -> StringType
+    {
+        return leaf_label(object_name_or_empty(actor)) + STR(" ") + leaf_label(object_name_or_empty(component));
     }
 
     auto object_instance_path(Unreal::UObject* object) -> StringType
@@ -1154,6 +1206,664 @@ namespace
     auto prop_type_name(Unreal::FProperty* property) -> StringType
     {
         return property ? property->GetClass().GetName() : StringType{};
+    }
+
+    auto enum_options_for_property(Unreal::FProperty* property, int limit = 16) -> StringType
+    {
+        Unreal::UEnum* enum_obj = nullptr;
+        if (auto* enum_prop = Unreal::CastField<Unreal::FEnumProperty>(property))
+        {
+            enum_obj = Unreal::ToRawPtr(enum_prop->GetEnum());
+        }
+        else if (auto* byte_prop = Unreal::CastField<Unreal::FByteProperty>(property))
+        {
+            enum_obj = Unreal::ToRawPtr(byte_prop->GetEnum());
+        }
+        if (!enum_obj)
+        {
+            return STR("<none>");
+        }
+
+        StringType out = enum_obj->GetFullName();
+        out += STR("[");
+        int count = 0;
+        for (const auto& pair : enum_obj->ForEachName())
+        {
+            if (count > 0)
+            {
+                out += STR(";");
+            }
+            out += pair.Key.ToString();
+            out += STR("=");
+            out += std::to_wstring(pair.Value);
+            if (++count >= limit)
+            {
+                out += STR(";...");
+                break;
+            }
+        }
+        out += STR("]");
+        return out;
+    }
+
+    auto diagnostic_api_token_match(const StringType& text) -> bool
+    {
+        return contains_any_text(text,
+                                 {STR("palette"),
+                                  STR("eyedrop"),
+                                  STR("picker"),
+                                  STR("pick"),
+                                  STR("sample"),
+                                  STR("probe"),
+                                  STR("color"),
+                                  STR("rough"),
+                                  STR("metal"),
+                                  STR("scalar"),
+                                  STR("material"),
+                                  STR("paint"),
+                                  STR("brush"),
+                                  STR("channel"),
+                                  STR("texture"),
+                                  STR("uv")});
+    }
+
+    auto atlas_probe_token_match(const StringType& text) -> bool
+    {
+        return contains_any_text(text,
+                                 {STR("atlas"),
+                                  STR("uv"),
+                                  STR("mesh"),
+                                  STR("skeletal"),
+                                  STR("skin"),
+                                  STR("vertex"),
+                                  STR("triangle"),
+                                  STR("section"),
+                                  STR("lod"),
+                                  STR("paint"),
+                                  STR("texture"),
+                                  STR("render"),
+                                  STR("target"),
+                                  STR("channel"),
+                                  STR("brush"),
+                                  STR("material"),
+                                  STR("body"),
+                                  STR("surface"),
+                                  STR("data"),
+                                  STR("coordinate")});
+    }
+
+    auto function_param_summary(Unreal::UFunction* function, int limit = 10) -> StringType
+    {
+        StringType out{};
+        int count = 0;
+        if (!function)
+        {
+            return out;
+        }
+        for (auto* property : function->ForEachProperty())
+        {
+            if (!property)
+            {
+                continue;
+            }
+            if (!out.empty())
+            {
+                out += STR(";");
+            }
+            out += property->GetName();
+            out += STR(":");
+            out += prop_type_name(property);
+            if (property->HasAnyPropertyFlags(Unreal::CPF_ReturnParm))
+            {
+                out += STR(":return");
+            }
+            if (++count >= limit)
+            {
+                out += STR(";...");
+                break;
+            }
+        }
+        return out.empty() ? STR("<none>") : out;
+    }
+
+    auto prop_value_ptr(uint8_t* container, Unreal::FProperty* property) -> uint8_t*;
+
+    auto log_atlas_probe_array_stats(const CharType* label,
+                                     const StringType& owner_name,
+                                     Unreal::FArrayProperty* array_property,
+                                     uint8_t* container) -> void
+    {
+        if (!label || !array_property || !container)
+        {
+            return;
+        }
+        auto* inner = array_property->GetInner();
+        auto* array = reinterpret_cast<Unreal::FScriptArray*>(prop_value_ptr(container, array_property));
+        if (!inner || !array)
+        {
+            return;
+        }
+
+        const auto inner_type = prop_type_name(inner);
+        const auto element_size = std::max(1, inner->GetSize());
+        const auto num = array->NumUnchecked();
+        const auto max = array->Max();
+        bool valid = num >= 0 && max >= num && num < 64 * 1024 * 1024;
+        uint64_t hash = 1469598103934665603ULL;
+        int first0 = -1;
+        int first1 = -1;
+        int first2 = -1;
+        int first3 = -1;
+        Unreal::UObject* first_object = nullptr;
+        auto* data = valid ? static_cast<uint8_t*>(array->GetData()) : nullptr;
+        const size_t bytes = valid ? static_cast<size_t>(num) * static_cast<size_t>(element_size) : 0;
+        if (data && bytes > 0)
+        {
+            const auto sample_bytes = std::min<size_t>(bytes, 64 * 1024);
+            hash = fnv1a_update(hash, data, sample_bytes);
+            first0 = data[0];
+            if (bytes > 1)
+            {
+                first1 = data[1];
+            }
+            if (bytes > 2)
+            {
+                first2 = data[2];
+            }
+            if (bytes > 3)
+            {
+                first3 = data[3];
+            }
+            if (contains_text(lower_copy(inner_type), STR("object")) && element_size >= static_cast<int>(sizeof(Unreal::UObject*)))
+            {
+                first_object = *reinterpret_cast<Unreal::UObject**>(data);
+            }
+        }
+
+        RC::Output::send<RC::LogLevel::Warning>(
+            STR("{} atlas_dump kind=array_stats label={} owner={} array={} inner_type={} valid={} num={} max={} element_size={} hash={} first_bytes=({}, {}, {}, {}) first_object={}\n"),
+            ModTag,
+            label,
+            owner_name.empty() ? STR("<object>") : owner_name,
+            array_property->GetName(),
+            inner_type,
+            valid ? 1 : 0,
+            num,
+            max,
+            element_size,
+            hash,
+            first0,
+            first1,
+            first2,
+            first3,
+            first_object ? first_object->GetFullName() : STR("<null>"));
+    }
+
+    auto log_atlas_probe_struct_fields(const CharType* label,
+                                       const StringType& parent_name,
+                                       Unreal::FStructProperty* struct_property,
+                                       uint8_t* container,
+                                       int field_limit = 48) -> void
+    {
+        if (!label || parent_name.empty() || !struct_property || !container)
+        {
+            return;
+        }
+        auto* structure = Unreal::ToRawPtr(struct_property->GetStruct());
+        if (!structure)
+        {
+            return;
+        }
+
+        auto* struct_base = container + struct_property->GetOffset_Internal();
+        const auto parent_key = lower_copy(parent_name);
+        int fields = 0;
+        for (auto* field : Unreal::TFieldRange<Unreal::FProperty>(structure,
+                                                                  Unreal::EFieldIterationFlags::IncludeDeprecated))
+        {
+            if (!field)
+            {
+                continue;
+            }
+            const auto field_key = lower_copy(field->GetName());
+            const auto type = prop_type_name(field);
+            const auto typed = parent_key + STR(" ") + field_key + STR(" ") + lower_copy(type);
+            if (!atlas_probe_token_match(parent_key) && !atlas_probe_token_match(typed))
+            {
+                continue;
+            }
+
+            auto* object_value = read_object(field, struct_base);
+            const auto number_value = read_number(field, struct_base);
+            const auto has_bool = type == STR("BoolProperty");
+            const auto bool_value = has_bool ? read_bool(field, struct_base) : false;
+            RC::Output::send<RC::LogLevel::Warning>(
+                STR("{} atlas_dump kind=struct_field label={} struct={} struct_type={} field={} type={} object_value={} number_value={} has_number={} bool_value={} has_bool={}\n"),
+                ModTag,
+                label,
+                parent_name,
+                structure->GetFullName(),
+                field->GetName(),
+                type,
+                object_value ? object_value->GetFullName() : STR("<null>"),
+                number_value.value_or(0.0),
+                number_value ? 1 : 0,
+                bool_value ? 1 : 0,
+                has_bool ? 1 : 0);
+            if (auto* array_property = Unreal::CastField<Unreal::FArrayProperty>(field))
+            {
+                log_atlas_probe_array_stats(label, parent_name, array_property, struct_base);
+            }
+            if (++fields >= field_limit)
+            {
+                RC::Output::send<RC::LogLevel::Warning>(
+                    STR("{} atlas_dump kind=struct_field label={} struct={} truncated=1 limit={}\n"),
+                    ModTag,
+                    label,
+                    parent_name,
+                    field_limit);
+                break;
+            }
+        }
+    }
+
+    auto log_replicated_paint_function_structs(const CharType* label, Unreal::UObject* object, int function_limit = 24) -> void
+    {
+        if (!DiagnosticsEnabled || !label || !object || !object->GetClassPrivate())
+        {
+            return;
+        }
+
+        int functions = 0;
+        for (auto* function : Unreal::TFieldRange<Unreal::UFunction>(object->GetClassPrivate(),
+                                                                      Unreal::EFieldIterationFlags::IncludeAll))
+        {
+            if (!function)
+            {
+                continue;
+            }
+            const auto lower_name = lower_copy(function->GetName());
+            const auto is_replicated_paint =
+                contains_text(lower_name, STR("server")) ||
+                contains_text(lower_name, STR("multicast")) ||
+                contains_text(lower_name, STR("sendpaint")) ||
+                contains_text(lower_name, STR("requestpaint")) ||
+                contains_text(lower_name, STR("paintbatch")) ||
+                contains_text(lower_name, STR("paintstroke")) ||
+                contains_text(lower_name, STR("paintatuv"));
+            if (!is_replicated_paint)
+            {
+                continue;
+            }
+
+            RC::Output::send<RC::LogLevel::Warning>(
+                STR("{} atlas_dump kind=replicated_paint_function label={} function={} params={}\n"),
+                ModTag,
+                label,
+                function->GetFullName(),
+                function_param_summary(function, 24));
+
+            for (auto* property : function->ForEachProperty())
+            {
+                if (!property || !property->HasAnyPropertyFlags(Unreal::CPF_Parm) ||
+                    property->HasAnyPropertyFlags(Unreal::CPF_ReturnParm))
+                {
+                    continue;
+                }
+                auto* struct_property = Unreal::CastField<Unreal::FStructProperty>(property);
+                if (!struct_property)
+                {
+                    continue;
+                }
+                auto* structure = Unreal::ToRawPtr(struct_property->GetStruct());
+                if (!structure)
+                {
+                    continue;
+                }
+                int fields = 0;
+                for (auto* field : Unreal::TFieldRange<Unreal::FProperty>(structure,
+                                                                          Unreal::EFieldIterationFlags::IncludeDeprecated))
+                {
+                    if (!field)
+                    {
+                        continue;
+                    }
+                    RC::Output::send<RC::LogLevel::Warning>(
+                        STR("{} atlas_dump kind=replicated_paint_struct_field label={} function={} param={} struct_type={} field={} type={} offset={} size={} enum_options={}\n"),
+                        ModTag,
+                        label,
+                        function->GetFullName(),
+                        property->GetName(),
+                        structure->GetFullName(),
+                        field->GetName(),
+                        prop_type_name(field),
+                        field->GetOffset_Internal(),
+                        field->GetSize(),
+                        enum_options_for_property(field));
+                    if (++fields >= 64)
+                    {
+                        RC::Output::send<RC::LogLevel::Warning>(
+                            STR("{} atlas_dump kind=replicated_paint_struct_field label={} function={} param={} truncated=1 limit=64\n"),
+                            ModTag,
+                            label,
+                            function->GetFullName(),
+                            property->GetName());
+                        break;
+                    }
+                }
+            }
+
+            if (++functions >= function_limit)
+            {
+                RC::Output::send<RC::LogLevel::Warning>(
+                    STR("{} atlas_dump kind=replicated_paint_function label={} truncated=1 limit={}\n"),
+                    ModTag,
+                    label,
+                    function_limit);
+                break;
+            }
+        }
+    }
+
+    auto log_relevant_object_api(const CharType* label, Unreal::UObject* object, int limit = 48) -> void
+    {
+        if (!label || !object || !object->GetClassPrivate())
+        {
+            return;
+        }
+        int functions = 0;
+        for (auto* function : Unreal::TFieldRange<Unreal::UFunction>(object->GetClassPrivate(),
+                                                                      Unreal::EFieldIterationFlags::IncludeAll))
+        {
+            if (!function)
+            {
+                continue;
+            }
+            const auto name = lower_copy(function->GetName());
+            if (!diagnostic_api_token_match(name))
+            {
+                continue;
+            }
+            RC::Output::send<RC::LogLevel::Verbose>(
+                STR("{} reflection_api kind=function label={} object={} function={} params={}\n"),
+                ModTag,
+                label,
+                object->GetFullName(),
+                function->GetFullName(),
+                function_param_summary(function));
+            if (++functions >= limit)
+            {
+                RC::Output::send<RC::LogLevel::Verbose>(
+                    STR("{} reflection_api kind=function label={} object={} truncated=1 limit={}\n"),
+                    ModTag,
+                    label,
+                    object->GetFullName(),
+                    limit);
+                break;
+            }
+        }
+
+        int properties = 0;
+        for (auto* property : Unreal::TFieldRange<Unreal::FProperty>(object->GetClassPrivate(),
+                                                                     Unreal::EFieldIterationFlags::IncludeDeprecated))
+        {
+            if (!property)
+            {
+                continue;
+            }
+            const auto name = lower_copy(property->GetName());
+            const auto typed = name + STR(" ") + lower_copy(prop_type_name(property));
+            if (!diagnostic_api_token_match(typed))
+            {
+                continue;
+            }
+            RC::Output::send<RC::LogLevel::Verbose>(
+                STR("{} reflection_api kind=property label={} object={} property={} type={}\n"),
+                ModTag,
+                label,
+                object->GetFullName(),
+                property->GetName(),
+                prop_type_name(property));
+            if (++properties >= limit)
+            {
+                RC::Output::send<RC::LogLevel::Verbose>(
+                    STR("{} reflection_api kind=property label={} object={} truncated=1 limit={}\n"),
+                    ModTag,
+                    label,
+                    object->GetFullName(),
+                    limit);
+                break;
+            }
+        }
+    }
+
+    auto log_atlas_probe_object_dump(const CharType* label,
+                                     Unreal::UObject* object,
+                                     int function_limit = 96,
+                                     int property_limit = 96) -> void
+    {
+        if (!label || !object || !object->GetClassPrivate())
+        {
+            RC::Output::send<RC::LogLevel::Warning>(
+                STR("{} atlas_dump label={} object=<null> dump_unavailable=1\n"),
+                ModTag,
+                label ? label : STR("<null>"));
+            return;
+        }
+
+        RC::Output::send<RC::LogLevel::Warning>(
+            STR("{} atlas_dump label={} object={} class={} function_limit={} property_limit={}\n"),
+            ModTag,
+            label,
+            object->GetFullName(),
+            object->GetClassPrivate()->GetFullName(),
+            function_limit,
+            property_limit);
+
+        int functions = 0;
+        for (auto* function : Unreal::TFieldRange<Unreal::UFunction>(object->GetClassPrivate(),
+                                                                      Unreal::EFieldIterationFlags::IncludeAll))
+        {
+            if (!function)
+            {
+                continue;
+            }
+            const auto name = lower_copy(function->GetName());
+            if (!atlas_probe_token_match(name))
+            {
+                continue;
+            }
+            RC::Output::send<RC::LogLevel::Warning>(
+                STR("{} atlas_dump kind=function label={} function={} params={}\n"),
+                ModTag,
+                label,
+                function->GetFullName(),
+                function_param_summary(function, 18));
+            if (++functions >= function_limit)
+            {
+                RC::Output::send<RC::LogLevel::Warning>(
+                    STR("{} atlas_dump kind=function label={} truncated=1 limit={}\n"),
+                    ModTag,
+                    label,
+                    function_limit);
+                break;
+            }
+        }
+
+        int properties = 0;
+        for (auto* property : Unreal::TFieldRange<Unreal::FProperty>(object->GetClassPrivate(),
+                                                                     Unreal::EFieldIterationFlags::IncludeDeprecated))
+        {
+            if (!property)
+            {
+                continue;
+            }
+            const auto name = lower_copy(property->GetName());
+            const auto type = prop_type_name(property);
+            const auto typed = name + STR(" ") + lower_copy(type);
+            if (!atlas_probe_token_match(typed))
+            {
+                continue;
+            }
+
+            auto* object_value = read_object(property, reinterpret_cast<uint8_t*>(object));
+            const auto number_value = read_number(property, reinterpret_cast<uint8_t*>(object));
+            RC::Output::send<RC::LogLevel::Warning>(
+                STR("{} atlas_dump kind=property label={} property={} type={} object_value={} number_value={} has_number={}\n"),
+                ModTag,
+                label,
+                property->GetName(),
+                type,
+                object_value ? object_value->GetFullName() : STR("<null>"),
+                number_value.value_or(0.0),
+                number_value ? 1 : 0);
+            if (auto* struct_property = Unreal::CastField<Unreal::FStructProperty>(property))
+            {
+                log_atlas_probe_struct_fields(label,
+                                              property->GetName(),
+                                              struct_property,
+                                              reinterpret_cast<uint8_t*>(object));
+            }
+            if (auto* array_property = Unreal::CastField<Unreal::FArrayProperty>(property))
+            {
+                log_atlas_probe_array_stats(label, STR("<object>"), array_property, reinterpret_cast<uint8_t*>(object));
+            }
+            if (++properties >= property_limit)
+            {
+                RC::Output::send<RC::LogLevel::Warning>(
+                    STR("{} atlas_dump kind=property label={} truncated=1 limit={}\n"),
+                    ModTag,
+                    label,
+                    property_limit);
+                break;
+            }
+        }
+    }
+
+    auto log_atlas_probe_related_object_refs(const CharType* label,
+                                             Unreal::UObject* object,
+                                             int related_limit = 24) -> void
+    {
+        if (!label || !object || !object->GetClassPrivate())
+        {
+            return;
+        }
+
+        int related = 0;
+        for (auto* property : Unreal::TFieldRange<Unreal::FProperty>(object->GetClassPrivate(),
+                                                                     Unreal::EFieldIterationFlags::IncludeDeprecated))
+        {
+            if (!property)
+            {
+                continue;
+            }
+            const auto name = lower_copy(property->GetName());
+            const auto type = lower_copy(prop_type_name(property));
+            if (!atlas_probe_token_match(name + STR(" ") + type))
+            {
+                continue;
+            }
+            auto* object_value = read_object(property, reinterpret_cast<uint8_t*>(object));
+            if (!object_value || object_value == object)
+            {
+                continue;
+            }
+            RC::Output::send<RC::LogLevel::Warning>(
+                STR("{} atlas_dump kind=related_object owner_label={} property={} related={} related_class={}\n"),
+                ModTag,
+                label,
+                property->GetName(),
+                object_value->GetFullName(),
+                object_value->GetClassPrivate() ? object_value->GetClassPrivate()->GetFullName() : STR("<null>"));
+            log_atlas_probe_object_dump(STR("related"), object_value, 32, 32);
+            if (++related >= related_limit)
+            {
+                RC::Output::send<RC::LogLevel::Warning>(
+                    STR("{} atlas_dump kind=related_object owner_label={} truncated=1 limit={}\n"),
+                    ModTag,
+                    label,
+                    related_limit);
+                break;
+            }
+        }
+    }
+
+    auto log_atlas_probe_safe_getters(const CharType* label,
+                                      Unreal::UObject* object,
+                                      int getter_limit = 12) -> void
+    {
+        if (!label || !object || !object->GetClassPrivate())
+        {
+            return;
+        }
+
+        const std::array<const CharType*, 10> getter_names{
+            STR("GetSkinnedAsset"),
+            STR("GetSkeletalMeshAsset"),
+            STR("GetSkeletalMesh"),
+            STR("GetStaticMesh"),
+            STR("GetBodySetup"),
+            STR("GetPhysicsAsset"),
+            STR("GetBaseMaterial"),
+            STR("GetMaterial"),
+            STR("GetMeshPaintTexture"),
+            STR("GetPaintTexture"),
+        };
+
+        int getters = 0;
+        for (const auto* getter_name : getter_names)
+        {
+            auto* function = getter_name ? object->GetFunctionByNameInChain(getter_name) : nullptr;
+            if (!function)
+            {
+                continue;
+            }
+            bool has_input_params = false;
+            for (auto* property : function->ForEachProperty())
+            {
+                if (property && property->HasAnyPropertyFlags(Unreal::CPF_Parm) &&
+                    !property->HasAnyPropertyFlags(Unreal::CPF_ReturnParm))
+                {
+                    has_input_params = true;
+                    break;
+                }
+            }
+            if (has_input_params)
+            {
+                RC::Output::send<RC::LogLevel::Warning>(
+                    STR("{} atlas_dump kind=getter_result label={} object={} getter={} skipped=1 reason=input_params params={}\n"),
+                    ModTag,
+                    label,
+                    object->GetFullName(),
+                    getter_name,
+                    function_param_summary(function, 12));
+                continue;
+            }
+
+            auto* result = call_no_params_return_object(object, getter_name);
+            RC::Output::send<RC::LogLevel::Warning>(
+                STR("{} atlas_dump kind=getter_result label={} object={} getter={} result={} result_class={}\n"),
+                ModTag,
+                label,
+                object->GetFullName(),
+                getter_name,
+                result ? result->GetFullName() : STR("<null>"),
+                result && result->GetClassPrivate() ? result->GetClassPrivate()->GetFullName() : STR("<null>"));
+            if (result && result != object)
+            {
+                log_atlas_probe_object_dump(STR("getter_result"), result, 64, 64);
+                log_atlas_probe_related_object_refs(STR("getter_result"), result, 8);
+            }
+            if (++getters >= getter_limit)
+            {
+                RC::Output::send<RC::LogLevel::Warning>(
+                    STR("{} atlas_dump kind=getter_result label={} truncated=1 limit={}\n"),
+                    ModTag,
+                    label,
+                    getter_limit);
+                break;
+            }
+        }
     }
 
     auto struct_type(Unreal::FStructProperty* property) -> Unreal::UStruct*
@@ -1575,6 +2285,198 @@ namespace
     {
         auto* property = find_struct_property(structure, name);
         return property ? read_number(property, base) : std::nullopt;
+    }
+
+    auto dev_print_screen(Unreal::UObject* world_context, const CharType* message, double duration = 4.0) -> bool
+    {
+        if (!DiagnosticsEnabled || !world_context || !message)
+        {
+            return false;
+        }
+        auto* library = get_kismet_system_library();
+        auto* function = library ? library->GetFunctionByNameInChain(STR("PrintString")) : nullptr;
+        if (!library || !function)
+        {
+            RC::Output::send<RC::LogLevel::Warning>(
+                STR("{} ui_notify backend=kismet_print_string found=0 library={} function={} visible=0 visible_verified=0 reason=missing_function\n"),
+                ModTag,
+                library ? library->GetFullName() : STR("<null>"),
+                function ? function->GetFullName() : STR("<null>"));
+            return false;
+        }
+
+        std::vector<uint8_t> params(static_cast<size_t>(function->GetParmsSize()), 0);
+        std::vector<Unreal::FProperty*> cleanup_properties{};
+        bool wrote_string = false;
+        bool wrote_context = false;
+        bool wrote_duration = false;
+        for (auto* property : function->ForEachProperty())
+        {
+            if (!property || !property->HasAnyPropertyFlags(Unreal::CPF_Parm) ||
+                property->HasAnyPropertyFlags(Unreal::CPF_ReturnParm))
+            {
+                continue;
+            }
+
+            const auto name = lower_copy(property->GetName());
+            const auto type = prop_type_name(property);
+            if (contains_text(type, STR("ObjectProperty")) || contains_text(type, STR("ObjectPtrProperty")))
+            {
+                if (!wrote_context || contains_text(name, STR("world")))
+                {
+                    wrote_context = write_object(property, params.data(), world_context) || wrote_context;
+                }
+                continue;
+            }
+            if (type == STR("StrProperty"))
+            {
+                wrote_string = write_string(property, params.data(), message, &cleanup_properties) || wrote_string;
+                continue;
+            }
+            if (type == STR("BoolProperty"))
+            {
+                write_bool(property, params.data(), true);
+                continue;
+            }
+            if (auto* struct_property = Unreal::CastField<Unreal::FStructProperty>(property))
+            {
+                if (contains_text(name, STR("color")))
+                {
+                    write_struct_numbers(struct_property,
+                                         params.data(),
+                                         {{STR("R"), 1.0}, {STR("G"), 0.72}, {STR("B"), 0.12}, {STR("A"), 1.0}});
+                }
+                continue;
+            }
+            if (type == STR("NameProperty") && contains_text(name, STR("key")))
+            {
+                write_name(property, params.data(), STR("MecchaCamouflage"));
+                continue;
+            }
+            if (contains_text(name, STR("duration")) || (!wrote_duration && read_number(property, params.data()).has_value()))
+            {
+                wrote_duration = write_number(property, params.data(), duration) || wrote_duration;
+            }
+        }
+
+        if (!wrote_string)
+        {
+            RC::Output::send<RC::LogLevel::Warning>(
+                STR("{} ui_notify backend=kismet_print_string found=1 called=0 visible=0 visible_verified=0 reason=string_param_unavailable params={} world_context={} wrote_context={} wrote_duration={}\n"),
+                ModTag,
+                function_param_summary(function, 16),
+                world_context->GetFullName(),
+                wrote_context ? 1 : 0,
+                wrote_duration ? 1 : 0);
+            cleanup_written_properties(params.data(), cleanup_properties);
+            return false;
+        }
+        RC::Output::send<RC::LogLevel::Warning>(
+            STR("{} ui_notify backend=kismet_print_string found=1 called=1 visible=unverified visible_verified=0 reason=called_but_shipping_may_noop params={} world_context={} wrote_context={} wrote_string={} wrote_duration={} duration={}\n"),
+            ModTag,
+            function_param_summary(function, 16),
+            world_context->GetFullName(),
+            wrote_context ? 1 : 0,
+            wrote_string ? 1 : 0,
+            wrote_duration ? 1 : 0,
+            duration);
+        library->ProcessEvent(function, params.data());
+        cleanup_written_properties(params.data(), cleanup_properties);
+        return true;
+    }
+
+    auto dev_client_message(Unreal::UObject* controller, const CharType* message, double duration = 4.0) -> bool
+    {
+        if (!DiagnosticsEnabled || !controller || !message)
+        {
+            return false;
+        }
+        auto* function = controller->GetFunctionByNameInChain(STR("ClientMessage"));
+        if (!function)
+        {
+            RC::Output::send<RC::LogLevel::Warning>(
+                STR("{} ui_notify backend=player_controller_client_message found=0 called=0 visible=0 visible_verified=0 reason=missing_function controller={}\n"),
+                ModTag,
+                controller->GetFullName());
+            return false;
+        }
+
+        std::vector<uint8_t> params(static_cast<size_t>(function->GetParmsSize()), 0);
+        std::vector<Unreal::FProperty*> cleanup_properties{};
+        bool wrote_string = false;
+        bool wrote_type = false;
+        bool wrote_duration = false;
+        for (auto* property : function->ForEachProperty())
+        {
+            if (!property || !property->HasAnyPropertyFlags(Unreal::CPF_Parm) ||
+                property->HasAnyPropertyFlags(Unreal::CPF_ReturnParm))
+            {
+                continue;
+            }
+
+            const auto name = lower_copy(property->GetName());
+            const auto type = prop_type_name(property);
+            if (type == STR("StrProperty"))
+            {
+                wrote_string = write_string(property, params.data(), message, &cleanup_properties) || wrote_string;
+                continue;
+            }
+            if (type == STR("NameProperty"))
+            {
+                wrote_type = write_name(property, params.data(), STR("MecchaCamouflage")) || wrote_type;
+                continue;
+            }
+            if (contains_text(name, STR("life")) || contains_text(name, STR("duration")) ||
+                contains_text(name, STR("time")))
+            {
+                wrote_duration = write_number(property, params.data(), duration) || wrote_duration;
+            }
+        }
+
+        if (!wrote_string)
+        {
+            RC::Output::send<RC::LogLevel::Warning>(
+                STR("{} ui_notify backend=player_controller_client_message found=1 called=0 visible=0 visible_verified=0 reason=string_param_unavailable params={} controller={} wrote_type={} wrote_duration={}\n"),
+                ModTag,
+                function_param_summary(function, 16),
+                controller->GetFullName(),
+                wrote_type ? 1 : 0,
+                wrote_duration ? 1 : 0);
+            cleanup_written_properties(params.data(), cleanup_properties);
+            return false;
+        }
+
+        RC::Output::send<RC::LogLevel::Warning>(
+            STR("{} ui_notify backend=player_controller_client_message found=1 called=1 visible=unverified visible_verified=0 reason=called_client_message params={} controller={} wrote_string={} wrote_type={} wrote_duration={} duration={}\n"),
+            ModTag,
+            function_param_summary(function, 16),
+            controller->GetFullName(),
+            wrote_string ? 1 : 0,
+            wrote_type ? 1 : 0,
+            wrote_duration ? 1 : 0,
+            duration);
+        controller->ProcessEvent(function, params.data());
+        cleanup_written_properties(params.data(), cleanup_properties);
+        return true;
+    }
+
+    auto dev_notify_user(Unreal::UObject* world_context,
+                         Unreal::UObject* controller,
+                         const CharType* message,
+                         double duration = 4.0) -> bool
+    {
+        if (!DiagnosticsEnabled)
+        {
+            return false;
+        }
+        const bool print_string_called = dev_print_screen(world_context, message, duration);
+        const bool client_message_called = dev_client_message(controller, message, duration);
+        RC::Output::send<RC::LogLevel::Warning>(
+            STR("{} ui_notify summary print_string_called={} client_message_called={} visible_verified=0 message_route=dev_diagnostic\n"),
+            ModTag,
+            print_string_called ? 1 : 0,
+            client_message_called ? 1 : 0);
+        return print_string_called || client_message_called;
     }
 
     auto decode_screen_space_paint_result(Unreal::UFunction* function, uint8_t* params) -> ScreenSpaceHitResult
@@ -2234,6 +3136,464 @@ namespace
         return ok;
     }
 
+    auto write_paint_channel_data(Unreal::FProperty* property,
+                                  uint8_t* container,
+                                  const Color& color,
+                                  bool include_material_channels) -> bool
+    {
+        auto* struct_prop = Unreal::CastField<Unreal::FStructProperty>(property);
+        if (!struct_prop || !container)
+        {
+            return false;
+        }
+        auto* base = prop_value_ptr(container, struct_prop);
+        const auto* structure = struct_type(struct_prop);
+        bool wrote = false;
+        if (auto* albedo_prop = Unreal::CastField<Unreal::FStructProperty>(
+                find_struct_property(structure, STR("AlbedoColor"))))
+        {
+            wrote = write_linear_color(albedo_prop, base, color, 1.0) || wrote;
+        }
+        if (include_material_channels)
+        {
+            if (auto* metallic_prop = find_struct_property(structure, STR("Metallic")))
+            {
+                wrote = write_number(metallic_prop, base, clamp(color.metallic, 0.0, 1.0)) || wrote;
+            }
+            if (auto* roughness_prop = find_struct_property(structure, STR("Roughness")))
+            {
+                wrote = write_number(roughness_prop, base, clamp(color.roughness, 0.0, 1.0)) || wrote;
+            }
+        }
+        if (auto* height_prop = find_struct_property(structure, STR("Height")))
+        {
+            wrote = write_number(height_prop, base, 0.0) || wrote;
+        }
+        if (auto* apply_mode_prop = find_struct_property(structure, STR("ApplyMode")))
+        {
+            wrote = write_number(apply_mode_prop, base, 1.0) || wrote;
+        }
+        return wrote;
+    }
+
+    struct RuntimePaintBrushSettings
+    {
+        double radius{5.0};
+        double hardness{1.0};
+        double opacity{1.0};
+        double spacing{0.25};
+        double falloff{2.0};
+        double blend_mode{0.0};
+        double rotation{0.0};
+        double effective_world_radius{5.0};
+        double texture_min_radius{0.0};
+        double texture_max_radius{0.0};
+        double subdivision_pixel_size{1.0};
+        int template_resolution{0};
+        int subdivision_level{0};
+        int max_generated_brush_triangles{0};
+        int gutter_expand_pixels{0};
+        int seed_radius_px{1};
+        int apply_mode{1};
+        StringType source{STR("density_adaptive_texture_options")};
+    };
+
+    auto read_component_struct_number(Unreal::UObject* component,
+                                      const CharType* struct_property_name,
+                                      const CharType* field_name) -> std::optional<double>
+    {
+        if (!component || !component->GetClassPrivate())
+        {
+            return std::nullopt;
+        }
+        auto* struct_property = Unreal::CastField<Unreal::FStructProperty>(
+            component->GetClassPrivate()->FindProperty(Unreal::FName(struct_property_name)));
+        if (!struct_property)
+        {
+            return std::nullopt;
+        }
+        auto* base = prop_value_ptr(reinterpret_cast<uint8_t*>(component), struct_property);
+        return read_number_from_struct(struct_type(struct_property), base, field_name);
+    }
+
+    auto read_current_brush_number(Unreal::UObject* component, const CharType* field_name) -> std::optional<double>
+    {
+        return read_component_struct_number(component, STR("CurrentBrushSettings"), field_name);
+    }
+
+    auto resolve_runtime_paint_brush_settings(Unreal::UObject* component, int seed_count)
+        -> RuntimePaintBrushSettings
+    {
+        RuntimePaintBrushSettings out{};
+        auto* albedo_rt = get_render_target_for_channel(component, 0);
+        const auto [texture_width, texture_height] = render_target_dimensions(albedo_rt);
+        out.seed_radius_px = MecchaCamouflage::Core::estimate_seed_radius_for_density(texture_width,
+                                                                                      texture_height,
+                                                                                      seed_count);
+        const auto texture_edge = static_cast<double>(std::max(1, std::max(texture_width, texture_height)));
+        const auto density_radius = static_cast<double>(std::max(1, out.seed_radius_px)) / texture_edge;
+        out.texture_min_radius = read_component_struct_number(component,
+                                                              STR("TextureOptions"),
+                                                              STR("DynamicSubdivisionMinBrushRadius"))
+                                     .value_or(0.02);
+        out.texture_max_radius = read_component_struct_number(component,
+                                                              STR("TextureOptions"),
+                                                              STR("DynamicSubdivisionMaxBrushRadius"))
+                                     .value_or(0.20);
+        if (out.texture_max_radius < out.texture_min_radius)
+        {
+            std::swap(out.texture_min_radius, out.texture_max_radius);
+        }
+        out.radius = clamp(density_radius, out.texture_min_radius, out.texture_max_radius);
+        out.effective_world_radius = out.radius;
+        out.template_resolution = std::max(texture_width, texture_height);
+        out.subdivision_pixel_size = read_component_struct_number(component,
+                                                                  STR("TextureOptions"),
+                                                                  STR("SubdivisionPixelSize"))
+                                         .value_or(6.0);
+        out.subdivision_level = static_cast<int>(std::round(
+            read_component_struct_number(component, STR("TextureOptions"), STR("DynamicSubdivisionMinLevel"))
+                .value_or(6.0)));
+        out.max_generated_brush_triangles = static_cast<int>(std::round(
+            read_component_struct_number(component, STR("TextureOptions"), STR("MaxGeneratedBrushTriangles"))
+                .value_or(12000.0)));
+        out.gutter_expand_pixels = static_cast<int>(std::round(
+            read_component_struct_number(component, STR("TextureOptions"), STR("GutterExpandPixels"))
+                .value_or(2.0)));
+        if (auto hardness = read_current_brush_number(component, STR("Hardness")))
+        {
+            out.hardness = clamp(*hardness, 0.0, 1.0);
+        }
+        if (auto opacity = read_current_brush_number(component, STR("Opacity")))
+        {
+            out.opacity = clamp(*opacity, 0.0, 1.0);
+        }
+        if (auto spacing = read_current_brush_number(component, STR("Spacing")))
+        {
+            out.spacing = std::max(0.001, *spacing);
+        }
+        if (auto falloff = read_current_brush_number(component, STR("Falloff")))
+        {
+            out.falloff = *falloff;
+        }
+        if (auto blend_mode = read_current_brush_number(component, STR("BlendMode")))
+        {
+            out.blend_mode = *blend_mode;
+        }
+        if (auto rotation = read_current_brush_number(component, STR("Rotation")))
+        {
+            out.rotation = *rotation;
+        }
+        return out;
+    }
+
+    auto write_runtime_brush_settings(Unreal::FProperty* property,
+                                      uint8_t* container,
+                                      Unreal::UObject* component,
+                                      const RuntimePaintBrushSettings& brush) -> bool
+    {
+        auto* struct_prop = Unreal::CastField<Unreal::FStructProperty>(property);
+        if (!struct_prop || !container)
+        {
+            return false;
+        }
+        auto* dest = prop_value_ptr(container, struct_prop);
+        if (component && component->GetClassPrivate())
+        {
+            if (auto* current = Unreal::CastField<Unreal::FStructProperty>(
+                    component->GetClassPrivate()->FindProperty(Unreal::FName(STR("CurrentBrushSettings")))))
+            {
+                const auto copy_size = std::min<int32_t>(struct_prop->GetElementSize(), current->GetElementSize());
+                if (copy_size > 0)
+                {
+                    std::memcpy(dest, prop_value_ptr(reinterpret_cast<uint8_t*>(component), current), static_cast<size_t>(copy_size));
+                }
+            }
+        }
+
+        const auto* structure = struct_type(struct_prop);
+        bool wrote = false;
+        const auto write_default = [&](const CharType* name, double value) {
+            if (auto* field = find_struct_property(structure, name))
+            {
+                wrote = write_number(field, dest, value) || wrote;
+            }
+        };
+        write_default(STR("Radius"), brush.radius);
+        write_default(STR("Hardness"), brush.hardness);
+        write_default(STR("Opacity"), brush.opacity);
+        write_default(STR("Spacing"), brush.spacing);
+        write_default(STR("Falloff"), brush.falloff);
+        write_default(STR("BlendMode"), brush.blend_mode);
+        write_default(STR("Rotation"), brush.rotation);
+        return wrote;
+    }
+
+    struct ReplicatedPaintCallResult
+    {
+        bool server_called{false};
+        bool local_echo_called{false};
+        StringType server_rpc{STR("<none>")};
+        StringType local_rpc{STR("<none>")};
+        StringType failure{};
+    };
+
+    auto call_uv_paint_function(Unreal::UObject* component,
+                                const CharType* function_name,
+                                const ScreenHitSample& sample,
+                                int channel,
+                                bool include_material_channels,
+                                bool allow_brush_settings,
+                                const RuntimePaintBrushSettings& brush,
+                                StringType& failure) -> bool
+    {
+        failure.clear();
+        if (!component)
+        {
+            failure = STR("runtime_paint_component_unavailable");
+            return false;
+        }
+        auto* function = component->GetFunctionByNameInChain(function_name);
+        if (!function)
+        {
+            failure = STR("paint_rpc_unavailable");
+            return false;
+        }
+
+        std::vector<uint8_t> params(static_cast<size_t>(function->GetParmsSize()), 0);
+        bool wrote_uv = false;
+        bool wrote_channel_data = false;
+        bool wrote_channel = false;
+        bool brush_required = false;
+        bool wrote_brush = false;
+        for (auto* property : function->ForEachProperty())
+        {
+            if (!property || !property->HasAnyPropertyFlags(Unreal::CPF_Parm) ||
+                property->HasAnyPropertyFlags(Unreal::CPF_ReturnParm))
+            {
+                continue;
+            }
+            const auto name = lower_copy(property->GetName());
+            if (name == STR("uv") || contains_text(name, STR("paintuv")))
+            {
+                wrote_uv = write_vector2(property, params.data(), sample.u, sample.v) || wrote_uv;
+                continue;
+            }
+            if (contains_text(name, STR("channeldata")))
+            {
+                wrote_channel_data =
+                    write_paint_channel_data(property, params.data(), sample.color, include_material_channels) ||
+                    wrote_channel_data;
+                continue;
+            }
+            if (contains_text(name, STR("brushsettings")))
+            {
+                brush_required = true;
+                if (allow_brush_settings)
+                {
+                    wrote_brush = write_runtime_brush_settings(property, params.data(), component, brush) || wrote_brush;
+                }
+                continue;
+            }
+            if (name == STR("channel") || name == STR("targetchannel") || contains_text(name, STR("paintchannel")))
+            {
+                wrote_channel = write_number(property, params.data(), static_cast<double>(channel)) || wrote_channel;
+                continue;
+            }
+        }
+
+        if (!wrote_uv || !wrote_channel_data || !wrote_channel || (brush_required && !wrote_brush))
+        {
+            failure = STR("paint_rpc_param_write_failed");
+            return false;
+        }
+
+        component->ProcessEvent(function, params.data());
+        if (!read_return_bool(function, params.data()))
+        {
+            failure = STR("paint_rpc_return_false");
+            return false;
+        }
+        return true;
+    }
+
+    auto write_paint_stroke_data(Unreal::FProperty* property,
+                                 uint8_t* container,
+                                 Unreal::UObject* component,
+                                 const ScreenHitSample& sample,
+                                 int channel,
+                                 bool include_material_channels,
+                                 const RuntimePaintBrushSettings& brush) -> bool
+    {
+        auto* struct_prop = Unreal::CastField<Unreal::FStructProperty>(property);
+        if (!struct_prop || !container)
+        {
+            return false;
+        }
+        auto* base = prop_value_ptr(container, struct_prop);
+        const auto* structure = struct_type(struct_prop);
+        bool wrote = false;
+        if (auto* uv_prop = find_struct_property(structure, STR("Uv")))
+        {
+            wrote = write_vector2(uv_prop, base, sample.u, sample.v) || wrote;
+        }
+        if (auto* world_prop = find_struct_property(structure, STR("WorldPosition")))
+        {
+            wrote = write_vector(world_prop, base, sample.world_position) || wrote;
+        }
+        if (auto* has_world_prop = find_struct_property(structure, STR("bHasWorldPosition")))
+        {
+            wrote = write_bool(has_world_prop, base, true) || wrote;
+        }
+        if (auto* has_local_prop = find_struct_property(structure, STR("bHasLocalPosition")))
+        {
+            wrote = write_bool(has_local_prop, base, false) || wrote;
+        }
+        if (auto* has_anchor_prop = find_struct_property(structure, STR("bHasSkeletalTriangleAnchor")))
+        {
+            wrote = write_bool(has_anchor_prop, base, false) || wrote;
+        }
+        if (auto* brush_prop = find_struct_property(structure, STR("BrushSettings")))
+        {
+            wrote = write_runtime_brush_settings(brush_prop, base, component, brush) || wrote;
+        }
+        if (auto* channel_data_prop = find_struct_property(structure, STR("ChannelData")))
+        {
+            wrote = write_paint_channel_data(channel_data_prop, base, sample.color, include_material_channels) || wrote;
+        }
+        if (auto* target_channel_prop = find_struct_property(structure, STR("TargetChannel")))
+        {
+            wrote = write_number(target_channel_prop, base, static_cast<double>(channel)) || wrote;
+        }
+        if (auto* radius_prop = find_struct_property(structure, STR("EffectiveBrushWorldRadius")))
+        {
+            wrote = write_number(radius_prop, base, brush.effective_world_radius) || wrote;
+        }
+        if (auto* subdiv_prop = find_struct_property(structure, STR("EffectiveSubdivisionLevel")))
+        {
+            wrote = write_number(subdiv_prop, base, static_cast<double>(brush.subdivision_level)) || wrote;
+        }
+        if (auto* pixel_size_prop = find_struct_property(structure, STR("EffectiveSubdivisionPixelSize")))
+        {
+            wrote = write_number(pixel_size_prop, base, brush.subdivision_pixel_size) || wrote;
+        }
+        if (auto* resolution_prop = find_struct_property(structure, STR("EffectiveTemplateResolution")))
+        {
+            wrote = write_number(resolution_prop, base, static_cast<double>(brush.template_resolution)) || wrote;
+        }
+        if (auto* triangles_prop = find_struct_property(structure, STR("EffectiveMaxGeneratedBrushTriangles")))
+        {
+            wrote = write_number(triangles_prop, base, static_cast<double>(brush.max_generated_brush_triangles)) || wrote;
+        }
+        if (auto* gutter_prop = find_struct_property(structure, STR("EffectiveGutterExpandPixels")))
+        {
+            wrote = write_number(gutter_prop, base, static_cast<double>(brush.gutter_expand_pixels)) || wrote;
+        }
+        return wrote;
+    }
+
+    auto call_stroke_paint_function(Unreal::UObject* component,
+                                    const CharType* function_name,
+                                    const ScreenHitSample& sample,
+                                    int channel,
+                                    bool include_material_channels,
+                                    const RuntimePaintBrushSettings& brush,
+                                    StringType& failure) -> bool
+    {
+        failure.clear();
+        if (!component)
+        {
+            failure = STR("runtime_paint_component_unavailable");
+            return false;
+        }
+        auto* function = component->GetFunctionByNameInChain(function_name);
+        if (!function)
+        {
+            failure = STR("paint_stroke_rpc_unavailable");
+            return false;
+        }
+
+        std::vector<uint8_t> params(static_cast<size_t>(function->GetParmsSize()), 0);
+        bool wrote_stroke = false;
+        for (auto* property : function->ForEachProperty())
+        {
+            if (!property || !property->HasAnyPropertyFlags(Unreal::CPF_Parm) ||
+                property->HasAnyPropertyFlags(Unreal::CPF_ReturnParm))
+            {
+                continue;
+            }
+            const auto name = lower_copy(property->GetName());
+            if (contains_text(name, STR("stroke")) && !contains_text(name, STR("batch")))
+            {
+                wrote_stroke = write_paint_stroke_data(property,
+                                                       params.data(),
+                                                       component,
+                                                       sample,
+                                                       channel,
+                                                       include_material_channels,
+                                                       brush) ||
+                               wrote_stroke;
+            }
+        }
+        if (!wrote_stroke)
+        {
+            failure = STR("paint_stroke_param_write_failed");
+            return false;
+        }
+        component->ProcessEvent(function, params.data());
+        if (!read_return_bool(function, params.data()))
+        {
+            failure = STR("paint_stroke_rpc_return_false");
+            return false;
+        }
+        return true;
+    }
+
+    auto call_replicated_paint_at_uv(Unreal::UObject* component,
+                                     const ScreenHitSample& sample,
+                                     int channel,
+                                     bool include_material_channels,
+                                     const RuntimePaintBrushSettings& brush) -> ReplicatedPaintCallResult
+    {
+        ReplicatedPaintCallResult result{};
+        constexpr std::array<const CharType*, 2> stroke_server_rpcs{STR("ServerSendPaint"), STR("ServerPaint")};
+        for (const auto* rpc : stroke_server_rpcs)
+        {
+            StringType failure{};
+            if (call_stroke_paint_function(component, rpc, sample, channel, include_material_channels, brush, failure))
+            {
+                result.server_called = true;
+                result.server_rpc = rpc;
+                break;
+            }
+            if (result.failure.empty())
+            {
+                result.failure = failure;
+            }
+        }
+        constexpr std::array<const CharType*, 1> local_rpcs{STR("PaintAtUVWithBrush")};
+        for (const auto* rpc : local_rpcs)
+        {
+            StringType failure{};
+            if (call_uv_paint_function(component, rpc, sample, channel, include_material_channels, true, brush, failure))
+            {
+                result.local_echo_called = true;
+                result.local_rpc = rpc;
+                break;
+            }
+            if (result.failure.empty())
+            {
+                result.failure = failure;
+            }
+        }
+
+        if (!result.server_called && result.failure.empty())
+        {
+            result.failure = STR("replicated_paint_rpc_unavailable");
+        }
+        return result;
+    }
+
     auto hash_component_paint_state(Unreal::UObject* component) -> uint64_t
     {
         auto hash = 1469598103934665603ULL;
@@ -2355,6 +3715,29 @@ namespace
         summary.avg_value = sum / denom;
         summary.near_uniform_samples = summary.max_value - summary.min_value < 0.006 ? 1 : 0;
         return summary;
+    }
+
+    auto sample_scalar_channel_at_uv(const ChannelByteBuffer& channel,
+                                     double u,
+                                     double v,
+                                     double fallback) -> double
+    {
+        if (!rgba_buffer_ready(channel))
+        {
+            return clamp(fallback, 0.0, 1.0);
+        }
+        const auto x = std::min(channel.width - 1,
+                                std::max(0, static_cast<int>(std::round(clamp(u, 0.0, 0.999999) *
+                                                                        static_cast<double>(channel.width - 1)))));
+        const auto y = std::min(channel.height - 1,
+                                std::max(0, static_cast<int>(std::round(clamp(v, 0.0, 0.999999) *
+                                                                        static_cast<double>(channel.height - 1)))));
+        const auto offset = static_cast<size_t>(y * channel.width + x) * 4;
+        if (offset >= channel.bytes.size())
+        {
+            return clamp(fallback, 0.0, 1.0);
+        }
+        return static_cast<double>(channel.bytes[offset]) / 255.0;
     }
 
 
@@ -4098,6 +5481,9 @@ namespace
 
         ++out.bulk_candidates;
         ++out.bulk_available;
+        out.function_path = function_path;
+        out.write_color_bool = write_color_bool;
+        out.color_bool_value = color_bool_value;
         std::vector<uint8_t> params(static_cast<size_t>(function->GetParmsSize()), 0);
         std::vector<Unreal::FArrayProperty*> array_params{};
         bool had_color_bool = false;
@@ -4186,6 +5572,36 @@ namespace
 
         std::vector<RenderTargetImage> images{};
         images.reserve(function_paths.size() * 3);
+        if (g_readback_backend_cache.valid)
+        {
+            auto cached = read_render_target_image_candidate(world_context,
+                                                            render_target,
+                                                            width,
+                                                            height,
+                                                            g_readback_backend_cache.function_path.c_str(),
+                                                            g_readback_backend_cache.write_color_bool,
+                                                            g_readback_backend_cache.color_bool_value);
+            if (cached.ok)
+            {
+                images.push_back(std::move(cached));
+                return images;
+            }
+            g_readback_backend_cache.valid = false;
+        }
+
+        auto preferred = read_render_target_image_candidate(world_context,
+                                                           render_target,
+                                                           width,
+                                                           height,
+                                                           STR("/Script/Engine.KismetRenderingLibrary:ReadRenderTargetRaw"),
+                                                           false,
+                                                           false);
+        if (preferred.ok)
+        {
+            images.push_back(std::move(preferred));
+            return images;
+        }
+
         for (const auto* path : function_paths)
         {
             images.push_back(read_render_target_image_candidate(world_context, render_target, width, height, path, false, false));
@@ -4331,24 +5747,13 @@ namespace
             result.image.failure = STR("world_unavailable");
             return result;
         }
-        std::optional<ActorHiddenGuard> hidden_guard{};
-        if (hide_pawn)
-        {
-            hidden_guard.emplace(pawn);
-            result.diagnostics.actor_hidden_guard_active = hidden_guard->active;
-        }
         Unreal::UObject* target_mesh = nullptr;
-        std::optional<ComponentVisibilityGuard> target_mesh_guard{};
         if (hide_pawn)
         {
+            // Keep the live pawn visible to the player; hide it only from the SceneCapture component.
             if (auto* paint_component = find_runtime_paint_component_for(pawn))
             {
                 target_mesh = find_target_mesh_for_runtime_paint(paint_component, pawn);
-            }
-            if (target_mesh && target_mesh != pawn)
-            {
-                target_mesh_guard.emplace(target_mesh);
-                result.diagnostics.target_mesh_hidden_guard_active = target_mesh_guard->active;
             }
         }
         auto* scene_capture_class =
@@ -4584,8 +5989,15 @@ namespace
             result.image.bulk_calibration_ok = best_image_index != static_cast<size_t>(-1) &&
                                                best_pairs >= std::min(16, wanted / 2) &&
                                                best_median <= 0.18 && separated_from_runner;
+            if (result.image.bulk_calibration_ok && !result.image.function_path.empty())
+            {
+                g_readback_backend_cache.valid = true;
+                g_readback_backend_cache.function_path = result.image.function_path;
+                g_readback_backend_cache.write_color_bool = result.image.write_color_bool;
+                g_readback_backend_cache.color_bool_value = result.image.color_bool_value;
+            }
             RC::Output::send<RC::LogLevel::Verbose>(
-                STR("{} bulk_readback_calibration selected={} ok={} samples={} pairs={} best_median={} runner_up_median={} flip=({}, {}) color_transform={} threshold=0.18 separated={} image_candidates={}\n"),
+                STR("{} bulk_readback_calibration selected={} ok={} samples={} pairs={} best_median={} runner_up_median={} flip=({}, {}) color_transform={} threshold=0.18 separated={} image_candidates={} readback_backend_cached={}\n"),
                 ModTag,
                 result.image.bulk_calibration_backend,
                 result.image.bulk_calibration_ok ? 1 : 0,
@@ -4597,7 +6009,8 @@ namespace
                 result.image.bulk_to_pixel_transform.flip_y ? 1 : 0,
                 result.image.color_transform_backend,
                 separated_from_runner ? 1 : 0,
-                image_candidates.size());
+                image_candidates.size(),
+                g_readback_backend_cache.valid ? 1 : 0);
         }
 
         call_no_params(capture_actor, STR("K2_DestroyActor"));
@@ -5019,6 +6432,161 @@ namespace
         return {std::max(1, std::min(width, 4096)), std::max(1, std::min(height, 4096))};
     }
 
+    auto has_function(Unreal::UObject* object, const CharType* name) -> bool
+    {
+        return object && object->GetFunctionByNameInChain(name) != nullptr;
+    }
+
+    auto apply_backend_label(MecchaCamouflage::Core::ApplyBackend backend) -> const CharType*
+    {
+        using MecchaCamouflage::Core::ApplyBackend;
+        switch (backend)
+        {
+        case ApplyBackend::NonBlockingTextureUpdate:
+            return STR("non_blocking_texture_update");
+        case ApplyBackend::ChunkedPaintApi:
+            return STR("chunked_paint_api");
+        case ApplyBackend::BatchedReflectedPaintApi:
+            return STR("batched_reflected_paint_api");
+        case ApplyBackend::BlockingImportChannelFromBytes:
+            return STR("blocking_import_channel_from_bytes");
+        case ApplyBackend::Unavailable:
+            return STR("unavailable");
+        case ApplyBackend::Unknown:
+        default:
+            return STR("unknown");
+        }
+    }
+
+    auto material_confidence_label(MecchaCamouflage::Core::MaterialConfidence confidence) -> const CharType*
+    {
+        using MecchaCamouflage::Core::MaterialConfidence;
+        switch (confidence)
+        {
+        case MaterialConfidence::PreservedOriginal:
+            return STR("preserved_original");
+        case MaterialConfidence::ScalarParameter:
+            return STR("scalar_parameter");
+        case MaterialConfidence::TextureParameter:
+            return STR("texture_parameter");
+        case MaterialConfidence::ConstantParameter:
+            return STR("constant_parameter");
+        case MaterialConfidence::Unknown:
+        default:
+            return STR("unknown");
+        }
+    }
+
+    auto probe_v2_runtime_capabilities(Unreal::UObject* component,
+                                       Unreal::UObject* mesh) -> MecchaCamouflage::Core::RuntimeCapabilities
+    {
+        MecchaCamouflage::Core::RuntimeCapabilities capabilities{};
+        capabilities.game_thread_tick = true;
+        capabilities.import_channel_from_bytes = has_function(component, STR("ImportChannelFromBytes"));
+        capabilities.paint_at_uv = has_function(component, STR("PaintAtUV"));
+        capabilities.paint_at_uv_with_brush = has_function(component, STR("PaintAtUVWithBrush"));
+        capabilities.paint_stroke_uv = has_function(component, STR("PaintStrokeUV"));
+        capabilities.server_paint_api = has_function(component, STR("ServerSendPaint")) ||
+                                        has_function(component, STR("ServerPaintBatch")) ||
+                                        has_function(component, STR("ServerPaint")) ||
+                                        has_function(component, STR("SendPaintToServer")) ||
+                                        has_function(component, STR("RequestPaintOnServer"));
+        capabilities.multicast_paint_api = has_function(component, STR("MulticastPaintToOthers")) ||
+                                           has_function(component, STR("MulticastPaintBatchToOthers")) ||
+                                           has_function(component, STR("MulticastPaintBatch")) ||
+                                           has_function(component, STR("MulticastPaint"));
+        capabilities.texture_sync_api = has_function(component, STR("ServerRequestTextureSync")) ||
+                                        has_function(component, STR("RequestFullTextureSync")) ||
+                                        has_function(component, STR("MulticastSyncCompressedChannelData")) ||
+                                        has_function(component, STR("MulticastSyncChannelData"));
+        capabilities.chunked_paint_api = capabilities.server_paint_api &&
+                                         (capabilities.paint_stroke_uv ||
+                                          capabilities.paint_at_uv_with_brush ||
+                                          capabilities.paint_at_uv ||
+                                          has_function(component, STR("ServerPaintBatch")));
+        capabilities.batched_reflected_paint_api = capabilities.chunked_paint_api;
+        capabilities.dominant_material_patterns = has_function(component, STR("GetDominantPaintMaterialPatterns"));
+        capabilities.material_parameter_names =
+            read_object_property_by_name(component, STR("DynamicMaterialInstance")) != nullptr ||
+            read_object_property_by_name(component, STR("CurrentBrushSettings")) != nullptr ||
+            read_object_property_by_name(component, STR("BrushMetallicAndRoughness")) != nullptr ||
+            read_number_property_by_name(component, STR("RoughnessParameterName")).has_value() ||
+            read_number_property_by_name(component, STR("MetallicParameterName")).has_value();
+
+        capabilities.mesh_paint_texture =
+            has_function(component, STR("GetRenderTarget")) ||
+            has_function(component, STR("ExportChannelToBytes")) ||
+            has_function(mesh, STR("GetMeshPaintTexture")) ||
+            has_function(mesh, STR("SetMeshPaintTexture")) ||
+            read_object_property_by_name(component, STR("MeshPaintTexture")) != nullptr ||
+            read_object_property_by_name(component, STR("PaintTexture")) != nullptr ||
+            read_object_property_by_name(component, STR("AlbedoRenderTarget")) != nullptr ||
+            read_object_property_by_name(component, STR("RenderTarget")) != nullptr ||
+            read_object_property_by_name(mesh, STR("MeshPaintTexture")) != nullptr;
+        capabilities.mesh_paint_uv_channel =
+            has_function(mesh, STR("GetMeshPaintTextureCoordinateIndex")) ||
+            has_function(component, STR("GetMeshPaintTextureCoordinateIndex")) ||
+            read_int_property_by_name(mesh, STR("MeshPaintTextureCoordinateIndex")).has_value() ||
+            read_int_property_by_name(component, STR("MeshPaintTextureCoordinateIndex")).has_value() ||
+            read_int_property_by_name(component, STR("PaintTextureCoordinateIndex")).has_value() ||
+            read_int_property_by_name(component, STR("UVChannelIndex")).has_value() ||
+            read_int_property_by_name(component, STR("UVChannel")).has_value() ||
+            read_int_property_by_name(component, STR("PaintUVChannel")).has_value();
+
+        // Native render-data and current skinned-pose access are intentionally not guessed through reflection.
+        capabilities.render_data_cpu_access = false;
+        capabilities.skinned_pose_snapshot = false;
+        capabilities.runtime_atlas_probe =
+            capabilities.mesh_paint_texture &&
+            capabilities.mesh_paint_uv_channel &&
+            capabilities.render_data_cpu_access &&
+            capabilities.skinned_pose_snapshot;
+        capabilities.non_blocking_texture_update =
+            capabilities.runtime_atlas_probe &&
+            has_function(mesh, STR("SetMeshPaintTexture"));
+        return capabilities;
+    }
+
+    auto probe_v2_runtime_atlas(Unreal::UObject* component,
+                                Unreal::UObject* mesh,
+                                const MecchaCamouflage::Core::RuntimeCapabilities& capabilities)
+        -> MecchaCamouflage::Core::RuntimeAtlasProbeReport
+    {
+        MecchaCamouflage::Core::RuntimeAtlasProbeReport probe{};
+        probe.source = "runtime_probe";
+        auto* albedo_target = get_render_target_for_channel(component, 0);
+        const auto [texture_width, texture_height] = render_target_dimensions(albedo_target);
+        probe.texture_width = texture_width;
+        probe.texture_height = texture_height;
+
+        if (!mesh)
+        {
+            probe.failure = "atlas_mesh_unavailable_no_import";
+            return MecchaCamouflage::Core::evaluate_runtime_atlas_probe(probe);
+        }
+        if (!capabilities.mesh_paint_texture)
+        {
+            probe.failure = "atlas_mesh_paint_texture_unavailable_no_import";
+            return MecchaCamouflage::Core::evaluate_runtime_atlas_probe(probe);
+        }
+        if (!capabilities.mesh_paint_uv_channel)
+        {
+            probe.failure = "atlas_uv_channel_unavailable_no_import";
+            return MecchaCamouflage::Core::evaluate_runtime_atlas_probe(probe);
+        }
+        if (!capabilities.render_data_cpu_access || !capabilities.skinned_pose_snapshot)
+        {
+            probe.failure = "atlas_source_unavailable_no_import";
+            return MecchaCamouflage::Core::evaluate_runtime_atlas_probe(probe);
+        }
+
+        probe.valid_texels = texture_width * texture_height;
+        probe.chart_count = 1;
+        probe.overlap_texels = 0;
+        probe.degenerate_texels = 0;
+        return MecchaCamouflage::Core::evaluate_runtime_atlas_probe(probe);
+    }
+
     auto channel_enum_label(Unreal::UFunction* function, int channel) -> StringType
     {
         if (!function)
@@ -5365,26 +6933,7 @@ namespace
 
     auto is_floor_like_object(Unreal::UObject* actor, Unreal::UObject* component) -> bool
     {
-        const auto text = lower_copy(object_name_or_empty(actor) + STR(" ") + object_name_or_empty(component));
-        return contains_any_text(text,
-                                 {STR("floor"),
-                                  STR("ground"),
-                                  STR("terrain"),
-                                  STR("landscape"),
-                                  STR("road"),
-                                  STR("asphalt"),
-                                  STR("concrete"),
-                                  STR("tile"),
-                                  STR("wood"),
-                                  STR("grass"),
-                                  STR("dirt"),
-                                  STR("soil"),
-                                  STR("sand"),
-                                  STR("stone"),
-                                  STR("rock"),
-                                  STR("plane"),
-                                  STR("walk"),
-                                  STR("stage")});
+        return MecchaCamouflage::Core::is_floor_like_label(narrow_ascii(surface_leaf_label(actor, component)));
     }
 
     auto luma(const Color& color) -> double
@@ -5412,7 +6961,7 @@ namespace
 
     auto classify_background(Unreal::UObject* actor, Unreal::UObject* component, const Unreal::FVector& location) -> Color
     {
-        auto text = lower_copy(object_name_or_empty(actor) + STR(" ") + object_name_or_empty(component));
+        auto text = lower_copy(surface_leaf_label(actor, component));
         Color color{};
         if (contains_text(text, STR("grass")) || contains_text(text, STR("leaf")) || contains_text(text, STR("foliage")) ||
             contains_text(text, STR("moss")) || contains_text(text, STR("plant")))
@@ -5603,6 +7152,12 @@ namespace
                     bool material_scalar_used = false;
                     if (auto* material = call_number_return_object(hit.component, STR("GetMaterial"), 0.0))
                     {
+                        static bool material_api_logged = false;
+                        if (!material_api_logged)
+                        {
+                            material_api_logged = true;
+                            log_relevant_object_api(STR("background_material"), material);
+                        }
                         material_color = classify_background(hit.actor, material, hit.location);
                         if (auto roughness = read_material_scalar_parameter(
                                 material,
@@ -5614,6 +7169,7 @@ namespace
                         {
                             material_color.roughness = *roughness;
                             material_scalar_used = true;
+                            out.has_roughness_scalar = true;
                         }
                         if (auto metallic = read_material_scalar_parameter(
                                 material,
@@ -5625,6 +7181,7 @@ namespace
                         {
                             material_color.metallic = *metallic;
                             material_scalar_used = true;
+                            out.has_metallic_scalar = true;
                         }
                     }
                     out.color = material_color;
@@ -5854,9 +7411,154 @@ namespace
         color.r = clamp(color.r * lift, 0.018, 0.98);
         color.g = clamp(color.g * lift, 0.018, 0.98);
         color.b = clamp(color.b * lift, 0.018, 0.98);
-        color.roughness = floor_like ? clamp(std::max(roughness, 0.86), 0.86, 0.99) : roughness;
-        color.metallic = floor_like ? clamp(metallic, 0.0, 0.12) : metallic;
+        (void)floor_like;
+        color.roughness = roughness;
+        color.metallic = metallic;
         return color;
+    }
+
+    auto collect_brush_query_front_samples(Unreal::UObject* pawn,
+                                           Unreal::UObject* mesh,
+                                           Unreal::UObject* controller,
+                                           const ViewportInfo& viewport,
+                                           double min_nx,
+                                           double max_nx,
+                                           double min_ny,
+                                           double max_ny,
+                                           const std::vector<ScreenHitSample>& existing_samples,
+                                           ProbeState& state,
+                                           BrushQuerySideStats& stats) -> std::vector<ScreenHitSample>
+    {
+        std::vector<ScreenHitSample> front_samples{};
+        if (!pawn || !mesh || !controller || viewport.width <= 0 || viewport.height <= 0 || state.cancelled)
+        {
+            stats.first_failure = STR("front_brush_query_prereq_unavailable");
+            return front_samples;
+        }
+
+        auto* query = find_screen_space_brush_query_for_pawn(pawn);
+        if (!query)
+        {
+            stats.first_failure = STR("screen_space_brush_query_unavailable");
+            return front_samples;
+        }
+        stats.query_name = query->GetFullName();
+        if (!configure_screen_space_brush_query(query, pawn, mesh))
+        {
+            stats.first_failure = STR("screen_space_brush_query_config_failed");
+            return front_samples;
+        }
+
+        const auto encode_texel = [](double u, double v) -> std::uint64_t {
+            const auto x = static_cast<std::uint64_t>(std::max(0, std::min(4095, static_cast<int>(u * 4096.0))));
+            const auto y = static_cast<std::uint64_t>(std::max(0, std::min(4095, static_cast<int>(v * 4096.0))));
+            return (y << 32) | x;
+        };
+
+        std::unordered_set<std::uint64_t> unique_texels{};
+        unique_texels.reserve(existing_samples.size() + 1536);
+        for (const auto& sample : existing_samples)
+        {
+            unique_texels.insert(encode_texel(sample.u, sample.v));
+        }
+
+        constexpr int grid_x = 36;
+        constexpr int grid_y = 52;
+        constexpr int target_front_seeds = 1024;
+        constexpr int hard_front_attempts = 1800;
+        const auto span_x = std::max(0.02, max_nx - min_nx);
+        const auto span_y = std::max(0.02, max_ny - min_ny);
+        const auto query_min_nx = clamp(min_nx - span_x * 0.20, 0.0, 1.0);
+        const auto query_max_nx = clamp(max_nx + span_x * 0.20, 0.0, 1.0);
+        const auto query_min_ny = clamp(min_ny - span_y * 0.12, 0.0, 1.0);
+        const auto query_max_ny = clamp(max_ny + span_y * 0.45, 0.0, 1.0);
+        front_samples.reserve(target_front_seeds);
+
+        for (int y = 0; y < grid_y; ++y)
+        {
+            if (stats.budget_exhausted || state.cancelled)
+            {
+                break;
+            }
+            for (int x = 0; x < grid_x; ++x)
+            {
+                if (stats.attempts >= hard_front_attempts || stats.seeds >= target_front_seeds)
+                {
+                    stats.budget_exhausted = true;
+                    break;
+                }
+                const auto local_nx = (static_cast<double>(x) + 0.5) / static_cast<double>(grid_x);
+                const auto local_ny = (static_cast<double>(y) + 0.5) / static_cast<double>(grid_y);
+                const auto nx = clamp(query_min_nx + local_nx * (query_max_nx - query_min_nx), 0.0, 1.0);
+                const auto ny = clamp(query_min_ny + local_ny * (query_max_ny - query_min_ny), 0.0, 1.0);
+                const auto screen_x = nx * static_cast<double>(viewport.width);
+                const auto screen_y = ny * static_cast<double>(viewport.height);
+                const auto ray = deproject_screen_position(controller, screen_x, screen_y);
+                if (!ray.ok)
+                {
+                    if (stats.first_failure.empty())
+                    {
+                        stats.first_failure = ray.failure.empty() ? STR("front_deproject_failed") : ray.failure;
+                    }
+                    continue;
+                }
+                ++stats.attempts;
+                auto hit = query_brush_from_world_ray(query, ray.location, ray.direction);
+                if (!hit.params_ok)
+                {
+                    if (stats.first_failure.empty())
+                    {
+                        stats.first_failure = hit.failure.empty() ? STR("front_brush_query_params_failed") : hit.failure;
+                    }
+                    continue;
+                }
+                if (!hit.success)
+                {
+                    continue;
+                }
+                ++stats.success;
+                const auto owner_hit = hit.component == mesh || object_is_or_belongs_to(hit.actor, pawn) ||
+                                       object_is_or_belongs_to(hit.component, pawn);
+                if (!owner_hit)
+                {
+                    continue;
+                }
+                ++stats.owner_hits;
+                if (!hit.has_uv || !std::isfinite(hit.u) || !std::isfinite(hit.v))
+                {
+                    continue;
+                }
+                ++stats.uv_hits;
+                const auto texel_key = encode_texel(hit.u, hit.v);
+                if (!unique_texels.insert(texel_key).second)
+                {
+                    ++stats.duplicate_texels;
+                    continue;
+                }
+
+                ScreenHitSample sample{};
+                sample.screen_x = screen_x;
+                sample.screen_y = screen_y;
+                sample.nx = nx;
+                sample.ny = ny;
+                sample.capture_nx = nx;
+                sample.capture_ny = ny;
+                sample.u = clamp(hit.u, 0.0, 0.999999);
+                sample.v = clamp(hit.v, 0.0, 0.999999);
+                sample.world_position = hit.world_position;
+                sample.normal = hit.normal;
+                sample.color = Color{0.34, 0.36, 0.32, 0.92, 0.0};
+                sample.floor_like = false;
+                front_samples.push_back(sample);
+                ++stats.seeds;
+            }
+        }
+
+        if (stats.first_failure.empty())
+        {
+            stats.first_failure = stats.seeds > 0 ? STR("<none>") : STR("front_brush_query_no_new_seeds");
+        }
+        return front_samples;
     }
 
     auto collect_brush_query_side_samples(Unreal::UObject* component,
@@ -5921,13 +7623,24 @@ namespace
         }
         base_outward = normalize(base_outward);
 
-        const std::array<double, 9> yaw_offsets{{-150.0, -120.0, -90.0, -60.0, 60.0, 90.0, 120.0, 150.0, 180.0}};
-        const std::array<double, 3> pitch_offsets{{-22.0, 0.0, 22.0}};
-        constexpr int grid_x = 24;
-        constexpr int grid_y = 36;
+        const auto side_policy = MecchaCamouflage::Core::choose_adaptive_sampling_policy(MecchaCamouflage::Core::AdaptiveSamplingInput{
+            viewport.width,
+            viewport.height,
+            hidden_image.width,
+            hidden_image.height,
+            half_width * 2.0,
+            half_height * 2.0,
+            static_cast<int>(direct_seeds.size()),
+            stats.duplicate_texels,
+            stats.attempts});
+        const auto virtual_views = MecchaCamouflage::Core::generate_golden_angle_views(side_policy.side_view_count, 42.0);
+        const auto grid_x = std::max(1, side_policy.side_grid_x);
+        const auto grid_y = std::max(1, side_policy.side_grid_y);
+        const auto target_side_seeds = std::max(side_policy.min_side_seeds, side_policy.target_side_seeds);
+        const auto hard_side_attempts = std::max(target_side_seeds, side_policy.hard_side_attempts);
         std::unordered_set<std::uint64_t> unique_side_texels{};
-        unique_side_texels.reserve(8192);
-        side_samples.reserve(32768);
+        unique_side_texels.reserve(static_cast<size_t>(hard_side_attempts));
+        side_samples.reserve(static_cast<size_t>(target_side_seeds));
 
         const auto encode_texel = [](double u, double v) -> std::uint64_t {
             const auto x = static_cast<std::uint64_t>(std::max(0, std::min(4095, static_cast<int>(u * 4096.0))));
@@ -5997,6 +7710,18 @@ namespace
         }
 
         const auto try_add_side_ray = [&](const Unreal::FVector& origin, const Unreal::FVector& ray_dir) -> void {
+            if (stats.attempts >= hard_side_attempts || stats.seeds >= target_side_seeds)
+            {
+                stats.budget_exhausted = true;
+                return;
+            }
+            if (stats.attempts >= target_side_seeds &&
+                stats.seeds >= std::max(64, target_side_seeds / 2) &&
+                stats.duplicate_texels > std::max(96, stats.success / 3))
+            {
+                stats.budget_exhausted = true;
+                return;
+            }
             ++stats.attempts;
             auto hit = query_brush_from_world_ray(query, origin, ray_dir);
             if (!hit.params_ok)
@@ -6095,19 +7820,21 @@ namespace
             sample.v = clamp(hit.v, 0.0, 0.999999);
             sample.world_position = hit.world_position;
             sample.normal = hit.normal;
-            auto traced = trace_nearest_background_behind_sample(pawn, frame.eye, sample);
-            auto material_hint = traced.hit ? traced.color : *color;
-            if (traced.hit)
-            {
-                ++stats.material_hits;
-            }
+            auto material_hint = nearest ? nearest->color : *color;
             auto resolved = sanitize_background_color(*color, material_hint);
-            if (traced.hit)
-            {
-                resolved.roughness = material_hint.roughness;
-                resolved.metallic = material_hint.metallic;
-            }
-            const auto floor_like = traced.floor_like || (nearest && nearest->floor_like);
+            const auto floor_like = nearest && nearest->floor_like;
+            const auto original_roughness = nearest ? nearest->color.roughness : resolved.roughness;
+            const auto original_metallic = nearest ? nearest->color.metallic : resolved.metallic;
+            const auto material = MecchaCamouflage::Core::resolve_material_channels(MecchaCamouflage::Core::MaterialResolveInput{
+                original_roughness,
+                original_metallic,
+                false,
+                0.0,
+                false,
+                0.0,
+                floor_like});
+            resolved.roughness = material.roughness;
+            resolved.metallic = material.metallic;
             resolved = compensate_projected_albedo_preserve_material(resolved, floor_like);
             sample.color = resolved;
             sample.floor_like = floor_like;
@@ -6116,57 +7843,72 @@ namespace
         };
 
         size_t virtual_view_index = 0;
-        for (const auto yaw : yaw_offsets)
+        for (const auto& view : virtual_views)
         {
-            for (const auto pitch : pitch_offsets)
+            if (stats.budget_exhausted)
             {
-                if (state.cancelled)
-                {
-                    return side_samples;
-                }
-                const auto outward = normalize(rotate_yaw_pitch(base_outward, yaw, pitch));
-                const auto origin_center = add(center, mul(outward, ray_distance));
-                const auto view_forward = normalize(sub(center, origin_center));
-                auto view_right = normalize(cross(vec(0.0, 0.0, 1.0), view_forward));
-                if (length(view_right) < 0.01)
-                {
-                    view_right = frame.right;
-                }
-                auto view_up = normalize(cross(view_forward, view_right));
-                if (length(view_up) < 0.01)
-                {
-                    view_up = vec(0.0, 0.0, 1.0);
-                }
+                break;
+            }
+            if (state.cancelled)
+            {
+                return side_samples;
+            }
+            const auto outward = normalize(rotate_yaw_pitch(base_outward, view.yaw_degrees, view.pitch_degrees));
+            const auto origin_center = add(center, mul(outward, ray_distance));
+            const auto view_forward = normalize(sub(center, origin_center));
+            auto view_right = normalize(cross(vec(0.0, 0.0, 1.0), view_forward));
+            if (length(view_right) < 0.01)
+            {
+                view_right = frame.right;
+            }
+            auto view_up = normalize(cross(view_forward, view_right));
+            if (length(view_up) < 0.01)
+            {
+                view_up = vec(0.0, 0.0, 1.0);
+            }
 
-                for (int y = 0; y < grid_y; ++y)
+            for (int y = 0; y < grid_y; ++y)
+            {
+                if (stats.budget_exhausted)
                 {
-                    for (int x = 0; x < grid_x; ++x)
+                    break;
+                }
+                for (int x = 0; x < grid_x; ++x)
+                {
+                    if (stats.budget_exhausted)
                     {
-                        const auto lx = ((static_cast<double>(x) + 0.5) / static_cast<double>(grid_x) - 0.5) * 2.0;
-                        const auto ly = ((static_cast<double>(y) + 0.5) / static_cast<double>(grid_y) - 0.5) * 2.0;
-                        const auto target = add(add(center, mul(view_right, lx * half_width)), mul(view_up, ly * half_height));
-                        const auto ray_dir = normalize(sub(target, origin_center));
-                        try_add_side_ray(origin_center, ray_dir);
+                        break;
                     }
-                }
-
-                constexpr int direct_target_rays_per_view = 1024;
-                const auto seed_count = direct_seeds.size();
-                const auto stride = std::max<size_t>(1, seed_count / static_cast<size_t>(direct_target_rays_per_view));
-                const auto view_offset = (virtual_view_index * 131u) % std::max<size_t>(1, seed_count);
-                const auto target_rays = std::min<size_t>(static_cast<size_t>(direct_target_rays_per_view), seed_count);
-                for (size_t i = 0; i < target_rays; ++i)
-                {
-                    const auto seed_index = (view_offset + i * stride) % seed_count;
-                    const auto jitter_x = (static_cast<double>((i * 17u + virtual_view_index * 7u) % 11u) - 5.0) * 1.4;
-                    const auto jitter_y = (static_cast<double>((i * 23u + virtual_view_index * 5u) % 13u) - 6.0) * 1.2;
-                    const auto target = add(add(direct_seeds[seed_index].world_position, mul(view_right, jitter_x)),
-                                            mul(view_up, jitter_y));
+                    const auto lx = ((static_cast<double>(x) + 0.5) / static_cast<double>(grid_x) - 0.5) * 2.0;
+                    const auto ly = ((static_cast<double>(y) + 0.5) / static_cast<double>(grid_y) - 0.5) * 2.0;
+                    const auto target = add(add(center, mul(view_right, lx * half_width)), mul(view_up, ly * half_height));
                     const auto ray_dir = normalize(sub(target, origin_center));
                     try_add_side_ray(origin_center, ray_dir);
                 }
-                ++virtual_view_index;
             }
+
+            const auto direct_target_rays_per_view = std::max<size_t>(
+                128,
+                static_cast<size_t>(hard_side_attempts / std::max(1, side_policy.side_view_count)));
+            const auto seed_count = direct_seeds.size();
+            const auto stride = std::max<size_t>(1, seed_count / direct_target_rays_per_view);
+            const auto view_offset = (virtual_view_index * 131u) % std::max<size_t>(1, seed_count);
+            const auto target_rays = std::min<size_t>(direct_target_rays_per_view, seed_count);
+            for (size_t i = 0; i < target_rays; ++i)
+            {
+                if (stats.budget_exhausted)
+                {
+                    break;
+                }
+                const auto seed_index = (view_offset + i * stride) % seed_count;
+                const auto jitter_x = (static_cast<double>((i * 17u + virtual_view_index * 7u) % 11u) - 5.0) * 1.4;
+                const auto jitter_y = (static_cast<double>((i * 23u + virtual_view_index * 5u) % 13u) - 6.0) * 1.2;
+                const auto target = add(add(direct_seeds[seed_index].world_position, mul(view_right, jitter_x)),
+                                        mul(view_up, jitter_y));
+                const auto ray_dir = normalize(sub(target, origin_center));
+                try_add_side_ray(origin_center, ray_dir);
+            }
+            ++virtual_view_index;
         }
 
         const std::array<double, 5> centerline_yaw_offsets{{-45.0, -30.0, 0.0, 30.0, 45.0}};
@@ -6180,8 +7922,16 @@ namespace
         }};
         for (const auto yaw : centerline_yaw_offsets)
         {
+            if (stats.budget_exhausted)
+            {
+                break;
+            }
             for (const auto pitch : centerline_pitch_offsets)
             {
+                if (stats.budget_exhausted)
+                {
+                    break;
+                }
                 if (state.cancelled)
                 {
                     return side_samples;
@@ -6201,8 +7951,16 @@ namespace
                 }
                 for (const auto* target_seed : centerline_targets)
                 {
+                    if (stats.budget_exhausted)
+                    {
+                        break;
+                    }
                     for (const auto& jitter : centerline_jitter)
                     {
+                        if (stats.budget_exhausted)
+                        {
+                            break;
+                        }
                         const auto target = add(add(target_seed->world_position, mul(view_right, jitter[0])),
                                                 mul(view_up, jitter[1]));
                         const auto ray_dir = normalize(sub(target, origin_center));
@@ -6253,23 +8011,45 @@ namespace
                                     double max_ny = 1.0,
                                     int target_hits = 0,
                                     int hard_max_attempts = 0,
-                                    bool enable_floor_trace = true) -> std::vector<ScreenHitSample>
+                                    bool enable_floor_trace = true,
+                                    double soft_budget_ms = 0.0,
+                                    int min_hits_before_budget_stop = 0,
+                                    int start_linear_index = 0,
+                                    int* next_linear_index = nullptr) -> std::vector<ScreenHitSample>
     {
+        const auto collection_start = SteadyClock::now();
         std::vector<ScreenHitSample> samples{};
         samples.reserve(static_cast<size_t>(grid_width * grid_height));
         const Color neutral_hint{0.34, 0.36, 0.32, 0.94, 0.0};
-        for (int y = 0; y < grid_height; ++y)
-        {
-            for (int x = 0; x < grid_width; ++x)
+        const auto total_cells = std::max(0, grid_width) * std::max(0, grid_height);
+        const auto set_next = [&](int value) {
+            if (next_linear_index)
             {
-                if (state.cancelled)
-                {
-                    return samples;
-                }
-                if (hard_max_attempts > 0 && stats.attempts >= hard_max_attempts)
-                {
-                    return samples;
-                }
+                *next_linear_index = std::max(0, std::min(total_cells, value));
+            }
+        };
+        for (int linear = std::max(0, start_linear_index); linear < total_cells; ++linear)
+        {
+            const auto y = linear / std::max(1, grid_width);
+            const auto x = linear - y * std::max(1, grid_width);
+            if (state.cancelled)
+            {
+                set_next(linear);
+                return samples;
+            }
+            if (hard_max_attempts > 0 && stats.attempts >= hard_max_attempts)
+            {
+                set_next(linear);
+                return samples;
+            }
+            if (soft_budget_ms > 0.0 &&
+                stats.hit_uv_count >= min_hits_before_budget_stop &&
+                elapsed_ms_since(collection_start) > soft_budget_ms)
+            {
+                stats.budget_exhausted = true;
+                set_next(linear);
+                return samples;
+            }
                 const auto local_nx = (static_cast<double>(x) + 0.5) / static_cast<double>(std::max(1, grid_width));
                 const auto local_ny = (static_cast<double>(y) + 0.5) / static_cast<double>(std::max(1, grid_height));
                 const auto nx = clamp(min_nx + local_nx * std::max(0.0, max_nx - min_nx), 0.0, 1.0);
@@ -6387,10 +8167,11 @@ namespace
                 ++stats.color_samples;
                 if (target_hits > 0 && stats.hit_uv_count >= target_hits)
                 {
+                    set_next(linear + 1);
                     return samples;
                 }
-            }
         }
+        set_next(total_cells);
         return samples;
     }
 
@@ -6399,7 +8180,7 @@ namespace
         -> void
     {
         RC::Output::send<RC::LogLevel::Verbose>(
-            STR("{} {} coord_mode={} attempts={} params_ok={} screen_hit_success={} hit_uv_count={} floor_hits={} color_samples={} failures={} uv_min=({}, {}) uv_max=({}, {}) screen_bbox=({}, {})-({}, {}) world_min=({}, {}, {}) world_max=({}, {}, {}) first_failure={}\n"),
+            STR("{} {} coord_mode={} attempts={} params_ok={} screen_hit_success={} hit_uv_count={} floor_hits={} color_samples={} failures={} uv_min=({}, {}) uv_max=({}, {}) screen_bbox=({}, {})-({}, {}) world_min=({}, {}, {}) world_max=({}, {}, {}) hit_budget_exhausted={} first_failure={}\n"),
             ModTag,
             label,
             coord_mode,
@@ -6424,6 +8205,7 @@ namespace
             stats.has_world_bounds ? stats.max_world.X() : 0.0,
             stats.has_world_bounds ? stats.max_world.Y() : 0.0,
             stats.has_world_bounds ? stats.max_world.Z() : 0.0,
+            stats.budget_exhausted ? 1 : 0,
             stats.first_failure.empty() ? STR("<none>") : stats.first_failure);
     }
 
@@ -6607,6 +8389,7 @@ namespace
         state.side_nearest_sources = 0;
         state.side_duplicate_texels = 0;
         state.side_normal_suspect = 0;
+        state.side_budget_exhausted = 0;
         state.side_backend = STR("disabled");
         state.commit_calls = 0;
         state.body_trace_hits = 0;
@@ -6661,6 +8444,16 @@ namespace
         auto* controller_view_target = call_no_params_return_object(controller, STR("GetViewTarget"));
         auto* camera_view_target = call_no_params_return_object(camera, STR("GetViewTarget"));
         auto* camera_owner = call_no_params_return_object(camera, STR("GetOwner"));
+        static bool reflection_api_logged = false;
+        if (!reflection_api_logged)
+        {
+            reflection_api_logged = true;
+            log_relevant_object_api(STR("runtime_paint_component"), component);
+            log_relevant_object_api(STR("pawn"), pawn);
+            log_relevant_object_api(STR("mesh"), mesh);
+            log_relevant_object_api(STR("controller"), controller);
+            log_relevant_object_api(STR("screen_space_brush_query"), find_screen_space_brush_query_for_pawn(pawn));
+        }
         log_pawn_camera_component_candidates(pawn, camera);
         const auto pawn_location = call_no_params_return_vector(pawn, STR("K2_GetActorLocation"));
         const auto mesh_location = call_no_params_return_vector(mesh, STR("K2_GetComponentLocation"));
@@ -6791,45 +8584,137 @@ namespace
         const auto max_ny = clamp(active_coarse_stats.max_ny + pad_y, 0.0, 1.0);
         const auto bbox_w_px = std::max(1.0, (max_nx - min_nx) * static_cast<double>(viewport.width));
         const auto bbox_h_px = std::max(1.0, (max_ny - min_ny) * static_cast<double>(viewport.height));
-        constexpr int target_paint_hits = 30000;
-        constexpr int min_paint_hits = 2048;
-        constexpr int hard_max_attempts = 45000;
-        const auto bbox_aspect = clamp(bbox_w_px / std::max(1.0, bbox_h_px), 0.25, 4.0);
-        auto refine_grid_x = std::max(24, static_cast<int>(std::round(std::sqrt(static_cast<double>(hard_max_attempts) * bbox_aspect))));
-        auto refine_grid_y = std::max(24, static_cast<int>(std::ceil(static_cast<double>(hard_max_attempts) / static_cast<double>(refine_grid_x))));
-        while (refine_grid_x * refine_grid_y > hard_max_attempts && refine_grid_y > 24)
-        {
-            --refine_grid_y;
-        }
-        while (refine_grid_x * refine_grid_y > hard_max_attempts && refine_grid_x > 24)
-        {
-            --refine_grid_x;
-        }
+        const auto sampling_policy = MecchaCamouflage::Core::choose_adaptive_sampling_policy(MecchaCamouflage::Core::AdaptiveSamplingInput{
+            viewport.width,
+            viewport.height,
+            0,
+            0,
+            bbox_w_px,
+            bbox_h_px,
+            static_cast<int>(active_coarse_samples.size()),
+            0,
+            active_coarse_stats.attempts});
+        const auto target_paint_hits = sampling_policy.target_front_hits;
+        const auto min_paint_hits = sampling_policy.min_front_hits;
+        const auto preferred_paint_hits = sampling_policy.preferred_front_hits;
+        const auto hard_max_attempts = sampling_policy.hard_max_attempts;
+        auto refine_grid_x = sampling_policy.refine_grid_x;
+        auto refine_grid_y = sampling_policy.refine_grid_y;
+        RC::Output::send<RC::LogLevel::Warning>(
+            STR("{} adaptive_sampling_policy viewport={}x{} bbox_px={}x{} target_front_hits={} preferred_front_hits={} min_front_hits={} hard_max_attempts={} refine_grid={}x{} target_side_seeds={} side_views={} side_grid={}x{} duplicate_limited={} job_stage=refined_hit\n"),
+            ModTag,
+            viewport.width,
+            viewport.height,
+            bbox_w_px,
+            bbox_h_px,
+            target_paint_hits,
+            preferred_paint_hits,
+            min_paint_hits,
+            hard_max_attempts,
+            refine_grid_x,
+            refine_grid_y,
+            sampling_policy.target_side_seeds,
+            sampling_policy.side_view_count,
+            sampling_policy.side_grid_x,
+            sampling_policy.side_grid_y,
+            sampling_policy.duplicate_limited ? 1 : 0);
         ScreenHitCollectionStats refined_stats{};
-        auto samples = collect_screen_hit_samples(component,
-                                                  pawn,
-                                                  mesh,
-                                                  controller,
-                                                  viewport,
-                                                  dummy_colors,
-                                                  1,
-                                                  1,
-                                                  refine_grid_x,
-                                                  refine_grid_y,
-                                                  use_normalized_coords,
-                                                  state,
-                                                  refined_stats,
-                                                  min_nx,
-                                                  max_nx,
-                                                  min_ny,
-                                                  max_ny,
-                                                  target_paint_hits,
-                                                  hard_max_attempts,
-                                                  false);
-        const auto hit_ms = elapsed_ms_since(hit_start);
+        std::vector<ScreenHitSample> samples{};
+        const auto cache_matches =
+            g_deferred_refined_hit_cache.valid &&
+            g_deferred_refined_hit_cache.component_name == component->GetFullName() &&
+            g_deferred_refined_hit_cache.pawn_name == pawn->GetFullName();
+        if (cache_matches)
+        {
+            samples = std::move(g_deferred_refined_hit_cache.samples);
+            refined_stats = g_deferred_refined_hit_cache.stats;
+            g_deferred_refined_hit_cache = DeferredRefinedHitCache{};
+            RC::Output::send<RC::LogLevel::Warning>(
+                STR("{} screen_body_refined deferred_cache_used=1 samples={} attempts={} hit_uv_count={} job_stage=refined_hit\n"),
+                ModTag,
+                samples.size(),
+                refined_stats.attempts,
+                refined_stats.hit_uv_count);
+        }
+        else
+        {
+            samples = collect_screen_hit_samples(component,
+                                                 pawn,
+                                                 mesh,
+                                                 controller,
+                                                 viewport,
+                                                 dummy_colors,
+                                                 1,
+                                                 1,
+                                                 refine_grid_x,
+                                                 refine_grid_y,
+                                                 use_normalized_coords,
+                                                 state,
+                                                 refined_stats,
+                                                 min_nx,
+                                                 max_nx,
+                                                 min_ny,
+                                                 max_ny,
+                                                 target_paint_hits,
+                                                 hard_max_attempts,
+                                                 false,
+                                                 8.0,
+                                                 0);
+        }
         log_screen_hit_stats(STR("screen_body_refined"),
                              use_normalized_coords ? STR("normalized_0_1") : STR("viewport_pixels"),
                              refined_stats);
+        if (!cache_matches && refined_stats.budget_exhausted && static_cast<int>(samples.size()) < min_paint_hits)
+        {
+            state.failures = 1;
+            state.last_failure = STR("frame_budget_exhausted_refined_hit_no_import");
+            RC::Output::send<RC::LogLevel::Warning>(
+                STR("{} play screen_body refused reason={} failure={} samples={} min_samples={} target_samples={} hard_max_attempts={} bbox_norm=({}, {})-({}, {}) bbox_px={}x{} refine_grid={}x{} no_import=1 no_clear=1 no_commit=1 no_mesh_hide=1 fallback_used=0 job_stage=refined_hit frame_budget_overrun=1 hit_budget_exhausted=1\n"),
+                ModTag,
+                reason.empty() ? STR("<none>") : reason,
+                state.last_failure,
+                samples.size(),
+                min_paint_hits,
+                target_paint_hits,
+                hard_max_attempts,
+                min_nx,
+                min_ny,
+                max_nx,
+                max_ny,
+                bbox_w_px,
+                bbox_h_px,
+                refine_grid_x,
+                refine_grid_y);
+            return false;
+        }
+        BrushQuerySideStats front_brush_stats{};
+        auto front_brush_samples = collect_brush_query_front_samples(pawn,
+                                                                     mesh,
+                                                                     controller,
+                                                                     viewport,
+                                                                     min_nx,
+                                                                     max_nx,
+                                                                     min_ny,
+                                                                     max_ny,
+                                                                     samples,
+                                                                     state,
+                                                                     front_brush_stats);
+        samples.insert(samples.end(), front_brush_samples.begin(), front_brush_samples.end());
+        const auto hit_ms = elapsed_ms_since(hit_start);
+        RC::Output::send<RC::LogLevel::Warning>(
+            STR("{} screen_body_front_brush_query enabled={} query={} attempts={} success={} owner_hits={} uv_hits={} seeds={} duplicate_texels={} t_hit_total_ms={} budget_exhausted={} first_failure={}\n"),
+            ModTag,
+            front_brush_stats.seeds > 0 ? 1 : 0,
+            front_brush_stats.query_name.empty() ? STR("<none>") : front_brush_stats.query_name,
+            front_brush_stats.attempts,
+            front_brush_stats.success,
+            front_brush_stats.owner_hits,
+            front_brush_stats.uv_hits,
+            front_brush_stats.seeds,
+            front_brush_stats.duplicate_texels,
+            hit_ms,
+            front_brush_stats.budget_exhausted ? 1 : 0,
+            front_brush_stats.first_failure.empty() ? STR("<none>") : front_brush_stats.first_failure);
         if (static_cast<int>(samples.size()) < min_paint_hits)
         {
             state.failures = 1;
@@ -6870,6 +8755,8 @@ namespace
         const auto trace_start = SteadyClock::now();
         std::vector<std::optional<Color>> traced_material_colors(samples.size());
         std::vector<uint8_t> traced_floor_like(samples.size(), 0);
+        std::vector<uint8_t> traced_roughness_scalar(samples.size(), 0);
+        std::vector<uint8_t> traced_metallic_scalar(samples.size(), 0);
         int trace_background_hits = 0;
         int trace_background_misses = 0;
         int trace_floor_hits = 0;
@@ -6886,7 +8773,8 @@ namespace
         double trace_project_delta_max = 0.0;
         int trace_project_samples = 0;
         const auto trace_project_stride = std::max<size_t>(1, samples.size() / 512);
-        for (size_t i = 0; i < samples.size(); ++i)
+        const auto trace_sample_limit = std::min(samples.size(), static_cast<size_t>(std::max(min_paint_hits, 2304)));
+        for (size_t i = 0; i < trace_sample_limit; ++i)
         {
             if (state.cancelled)
             {
@@ -6906,6 +8794,8 @@ namespace
                 ++trace_floor_hits;
                 traced_floor_like[i] = 1;
             }
+            traced_roughness_scalar[i] = traced.has_roughness_scalar ? 1 : 0;
+            traced_metallic_scalar[i] = traced.has_metallic_scalar ? 1 : 0;
             trace_distance_sum += traced.distance;
             trace_distance_max = std::max(trace_distance_max, traced.distance);
             const auto background_delta = sub(traced.trace.location, samples[i].world_position);
@@ -6934,11 +8824,31 @@ namespace
         }
         const auto trace_ms = elapsed_ms_since(trace_start);
         state.background_trace_hits = trace_background_hits;
-        state.body_trace_hits = refined_stats.hit_success;
-        state.uv_hits = refined_stats.hit_uv_count;
+        state.body_trace_hits = refined_stats.hit_success + front_brush_stats.success;
+        state.uv_hits = refined_stats.hit_uv_count + front_brush_stats.uv_hits;
 
-        const auto rt_width = std::max(1, viewport.width);
-        const auto rt_height = std::max(1, viewport.height);
+        auto* albedo_render_target_for_sizing = get_render_target_for_channel(component, 0);
+        const auto [paint_texture_width_for_capture, paint_texture_height_for_capture] =
+            render_target_dimensions(albedo_render_target_for_sizing);
+        const auto capture_sizing = MecchaCamouflage::Core::choose_capture_dimensions(MecchaCamouflage::Core::CaptureSizingInput{
+            viewport.width,
+            viewport.height,
+            paint_texture_width_for_capture,
+            paint_texture_height_for_capture,
+            0});
+        const auto capture_rt_width = std::max(1, capture_sizing.width);
+        const auto capture_rt_height = std::max(1, capture_sizing.height);
+        const auto rt_width = capture_rt_width;
+        const auto rt_height = capture_rt_height;
+        RC::Output::send<RC::LogLevel::Warning>(
+            STR("{} capability_probe capture_backend=ue_render_target capture_resolution_source={} viewport={}x{} rt_size={}x{} capture_scale={} failed_attempts=0 job_stage=capture_scene\n"),
+            ModTag,
+            RC::ensure_str(capture_sizing.reason.c_str()),
+            viewport.width,
+            viewport.height,
+            rt_width,
+            rt_height,
+            capture_sizing.scale);
         const int alignment_rt_width = std::max(
             320,
             std::min(rt_width, 1280));
@@ -7048,7 +8958,7 @@ namespace
                                                         frame->has_rotation ? &frame->rotation : nullptr,
                                                         &samples,
                                                         &capture_transform,
-                                                        128);
+                                                        48);
         pixel_diag = bulk_capture.diagnostics;
         RC::Output::send<RC::LogLevel::Verbose>(
             STR("{} screen_body capture_filter actor_hidden_guard={} target_mesh_hidden_guard={} hide_actor_components_called={} hide_target_component_called={} actor_rotation_set={} component_rotation_set={} capture_scene_called={} texture_target_written={} capture_source_written={} capture_every_frame_written={} capture_on_movement_written={}\n"),
@@ -7087,8 +8997,14 @@ namespace
         const auto capture_ms = elapsed_ms_since(capture_start);
         const auto color_summary = summarize_capture_colors(background_colors);
         const auto color_quality = summarize_capture_quality(background_colors);
+        const auto capture_rgb_max = std::max({color_summary.max_r, color_summary.max_g, color_summary.max_b});
+        const auto low_luma_suspect =
+            capture_rgb_max < MecchaCamouflage::Core::MinCaptureRgbMax ||
+            (color_quality.rgb_range < MecchaCamouflage::Core::MinCaptureRgbRange &&
+             color_quality.luma_range < MecchaCamouflage::Core::MinCaptureLumaRange);
         state.background_pixels = color_summary.pixels;
-        state.capture_pixels_ready = color_summary.pixels > 0 && !color_summary.uniform && !color_summary.clear_suspect;
+        state.capture_pixels_ready = color_summary.pixels > 0 && !color_summary.uniform && !color_summary.clear_suspect &&
+                                     !low_luma_suspect;
         const auto write_debug_artifacts = [&](const char* stage,
                                                const StringType& failure,
                                                bool validation_ok,
@@ -7096,7 +9012,21 @@ namespace
                                                double chroma_p95,
                                                const std::vector<uint8_t>* target_albedo,
                                                int target_albedo_width,
-                                               int target_albedo_height) {
+                                               int target_albedo_height,
+                                               const std::vector<uint8_t>* target_metallic = nullptr,
+                                               int target_metallic_width = 0,
+                                               int target_metallic_height = 0,
+                                               const std::vector<uint8_t>* target_roughness = nullptr,
+                                               int target_roughness_width = 0,
+                                               int target_roughness_height = 0,
+                                               double phase_export_ms = 0.0,
+                                               double phase_seed_ms = 0.0,
+                                               double phase_atlas_ms = 0.0,
+                                               double phase_import_ms = 0.0,
+                                               bool chroma_failed = false,
+                                               const char* material_confidence = "unknown",
+                                               const char* material_source = "unknown",
+                                               double phase_side_ms = 0.0) {
 #if MECCHA_CAMOUFLAGE_DIAGNOSTICS
             MecchaCamouflage::Diagnostics::RunArtifactData artifact{};
             artifact.run_id = state.play_id;
@@ -7111,6 +9041,18 @@ namespace
             artifact.bulk_runner_up_median = bulk_capture.image.bulk_calibration_runner_up_median;
             artifact.capture_trace_chroma_avg = chroma_avg;
             artifact.capture_trace_chroma_p95 = chroma_p95;
+            artifact.phase_hit_ms = hit_ms;
+            artifact.phase_trace_ms = trace_ms;
+            artifact.phase_capture_ms = capture_ms;
+            artifact.phase_export_ms = phase_export_ms;
+            artifact.phase_seed_ms = phase_seed_ms;
+            artifact.phase_side_ms = phase_side_ms;
+            artifact.phase_atlas_ms = phase_atlas_ms;
+            artifact.phase_import_ms = phase_import_ms;
+            artifact.low_luma_suspect = low_luma_suspect;
+            artifact.chroma_validation_failed = chroma_failed;
+            artifact.material_confidence = material_confidence ? material_confidence : "unknown";
+            artifact.material_source = material_source ? material_source : "unknown";
             artifact.viewport_width = viewport.width;
             artifact.viewport_height = viewport.height;
             artifact.bulk_calibration_candidates.reserve(bulk_capture.image.bulk_calibration_candidates.size());
@@ -7172,6 +9114,20 @@ namespace
                     target_albedo_height,
                     *target_albedo};
             }
+            if (target_metallic && target_metallic_width > 0 && target_metallic_height > 0)
+            {
+                artifact.target_metallic = MecchaCamouflage::Diagnostics::DiagnosticAlbedo{
+                    target_metallic_width,
+                    target_metallic_height,
+                    *target_metallic};
+            }
+            if (target_roughness && target_roughness_width > 0 && target_roughness_height > 0)
+            {
+                artifact.target_roughness = MecchaCamouflage::Diagnostics::DiagnosticAlbedo{
+                    target_roughness_width,
+                    target_roughness_height,
+                    *target_roughness};
+            }
             const auto artifact_path = MecchaCamouflage::Diagnostics::write_run_artifacts(artifact);
             RC::Output::send<RC::LogLevel::Warning>(
                 STR("{} diagnostics_artifacts path={} stage={} validation_ok={} fallback_used=0\n"),
@@ -7188,6 +9144,20 @@ namespace
             (void)target_albedo;
             (void)target_albedo_width;
             (void)target_albedo_height;
+            (void)target_metallic;
+            (void)target_metallic_width;
+            (void)target_metallic_height;
+            (void)target_roughness;
+            (void)target_roughness_width;
+            (void)target_roughness_height;
+            (void)phase_export_ms;
+            (void)phase_seed_ms;
+            (void)phase_atlas_ms;
+            (void)phase_import_ms;
+            (void)chroma_failed;
+            (void)material_confidence;
+            (void)material_source;
+            (void)phase_side_ms;
 #endif
         };
         if (!bulk_capture.image.ok || !bulk_capture.image.bulk_calibration_ok)
@@ -7216,6 +9186,7 @@ namespace
         {
             state.failures = 1;
             state.last_failure = STR("play_screen_body_background_unavailable");
+            write_debug_artifacts("background_trace_unavailable", state.last_failure, false, 0.0, 0.0, nullptr, 0, 0);
             RC::Output::send<RC::LogLevel::Warning>(
                 STR("{} play screen_body refused reason={} background_pixels={} trace_hits={} min_pixels={} readback_backend={} image_ok={} image_failure={} pixel_reads={} pixel_missing={} capture_ms={} trace_ms={} trace_primary=1 no_scene_capture=0 no_import=1 no_clear=1 no_commit=1 no_mesh_hide=1 no_trace_color_fallback=1\n"),
                 ModTag,
@@ -7232,12 +9203,15 @@ namespace
                 trace_ms);
             return false;
         }
-        if (color_summary.pixels < min_paint_hits || color_summary.uniform || color_summary.clear_suspect)
+        if (color_summary.pixels < min_paint_hits || color_summary.uniform || color_summary.clear_suspect ||
+            low_luma_suspect)
         {
             state.failures = 1;
-            state.last_failure = STR("play_screen_body_texture_color_unavailable_no_paint");
+            state.last_failure = low_luma_suspect ? STR("capture_color_quality_failed_no_paint")
+                                                  : STR("play_screen_body_texture_color_unavailable_no_paint");
+            write_debug_artifacts("texture_color_unavailable", state.last_failure, false, 0.0, 0.0, nullptr, 0, 0);
             RC::Output::send<RC::LogLevel::Warning>(
-                STR("{} play screen_body refused reason={} texture_source_unverified=1 background_pixels={} min_pixels={} uniform={} clear_suspect={} near_uniform={} rgb_min=({}, {}, {}) rgb_avg=({}, {}, {}) rgb_max=({}, {}, {}) color_score={} avg_chroma={} luma_range={} rgb_range={} readback_backend={} pixel_reads={} pixel_missing={} selected_fov={} transform_scale=({}, {}) transform_offset=({}, {}) capture_ms={} no_import=1 no_clear=1 no_commit=1 no_mesh_hide=1 no_palette_fallback=1 no_trace_color_fallback=1\n"),
+                STR("{} play screen_body refused reason={} texture_source_unverified=1 background_pixels={} min_pixels={} uniform={} clear_suspect={} near_uniform={} low_luma_suspect={} rgb_min=({}, {}, {}) rgb_avg=({}, {}, {}) rgb_max=({}, {}, {}) color_score={} avg_chroma={} luma_range={} rgb_range={} readback_backend={} pixel_reads={} pixel_missing={} selected_fov={} transform_scale=({}, {}) transform_offset=({}, {}) capture_ms={} no_import=1 no_clear=1 no_commit=1 no_mesh_hide=1 no_palette_fallback=1 no_trace_color_fallback=1 fallback_used=0 job_stage=quality_gate\n"),
                 ModTag,
                 reason.empty() ? STR("<none>") : reason,
                 color_summary.pixels,
@@ -7245,6 +9219,7 @@ namespace
                 color_summary.uniform ? 1 : 0,
                 color_summary.clear_suspect ? 1 : 0,
                 color_summary.near_uniform_samples,
+                low_luma_suspect ? 1 : 0,
                 color_summary.min_r,
                 color_summary.min_g,
                 color_summary.min_b,
@@ -7291,6 +9266,36 @@ namespace
                 roughness_before.failure.empty() ? STR("<none>") : roughness_before.failure);
             return false;
         }
+        RC::Output::send<RC::LogLevel::Warning>(
+            STR("{} paint_channel_export albedo_label={} albedo_target={} albedo_dims={}x{} albedo_num={} albedo_first=({}, {}, {}, {}) metallic_label={} metallic_target={} metallic_dims={}x{} metallic_num={} metallic_first=({}, {}, {}, {}) roughness_label={} roughness_target={} roughness_dims={}x{} roughness_num={} roughness_first=({}, {}, {}, {})\n"),
+            ModTag,
+            albedo_before.label,
+            albedo_before.target_name,
+            albedo_before.width,
+            albedo_before.height,
+            albedo_before.num,
+            albedo_before.first0,
+            albedo_before.first1,
+            albedo_before.first2,
+            albedo_before.first3,
+            metallic_before.label,
+            metallic_before.target_name,
+            metallic_before.width,
+            metallic_before.height,
+            metallic_before.num,
+            metallic_before.first0,
+            metallic_before.first1,
+            metallic_before.first2,
+            metallic_before.first3,
+            roughness_before.label,
+            roughness_before.target_name,
+            roughness_before.width,
+            roughness_before.height,
+            roughness_before.num,
+            roughness_before.first0,
+            roughness_before.first1,
+            roughness_before.first2,
+            roughness_before.first3);
 
         const auto seed_start = SteadyClock::now();
         std::vector<ResolvedSurfaceSeed> paint_seeds{};
@@ -7300,6 +9305,7 @@ namespace
         int capture_color_used = 0;
         int trace_only_color_used = 0;
         int capture_trace_pairs = 0;
+        int material_scalar_values = 0;
         double capture_trace_chroma_sum = 0.0;
         double capture_trace_chroma_max = 0.0;
         std::vector<double> capture_trace_chroma_values{};
@@ -7340,15 +9346,36 @@ namespace
                 const auto traced_material = *traced_material_colors[i];
                 if (has_capture_color)
                 {
-                    const auto distance = chroma_distance_rgb(color, traced_material);
+                    const auto distance = MecchaCamouflage::Core::chroma_distance_rgb(
+                        MecchaCamouflage::Core::Color{color.r, color.g, color.b, color.roughness, color.metallic},
+                        MecchaCamouflage::Core::Color{
+                            traced_material.r,
+                            traced_material.g,
+                            traced_material.b,
+                            traced_material.roughness,
+                            traced_material.metallic});
                     capture_trace_chroma_sum += distance;
                     capture_trace_chroma_max = std::max(capture_trace_chroma_max, distance);
                     capture_trace_chroma_values.push_back(distance);
                     ++capture_trace_pairs;
                 }
-                color.roughness = traced_material.roughness;
-                color.metallic = traced_material.metallic;
             }
+            const auto original_roughness = sample_scalar_channel_at_uv(roughness_before, samples[i].u, samples[i].v, color.roughness);
+            const auto original_metallic = sample_scalar_channel_at_uv(metallic_before, samples[i].u, samples[i].v, color.metallic);
+            const auto material = MecchaCamouflage::Core::resolve_material_channels(MecchaCamouflage::Core::MaterialResolveInput{
+                original_roughness,
+                original_metallic,
+                has_traced_color && i < traced_roughness_scalar.size() && traced_roughness_scalar[i] != 0,
+                has_traced_color ? traced_material_colors[i]->roughness : 0.0,
+                has_traced_color && i < traced_metallic_scalar.size() && traced_metallic_scalar[i] != 0,
+                has_traced_color ? traced_material_colors[i]->metallic : 0.0,
+                floor_like});
+            if (material.confidence == MecchaCamouflage::Core::MaterialConfidence::ScalarParameter)
+            {
+                ++material_scalar_values;
+            }
+            color.roughness = material.roughness;
+            color.metallic = material.metallic;
             color = compensate_projected_albedo_preserve_material(color, floor_like);
             roughness_min = std::min(roughness_min, color.roughness);
             roughness_max = std::max(roughness_max, color.roughness);
@@ -7370,6 +9397,9 @@ namespace
         const auto capture_trace_chroma_avg =
             capture_trace_pairs > 0 ? capture_trace_chroma_sum / static_cast<double>(capture_trace_pairs) : 0.0;
         const auto capture_trace_chroma_p95 = percentile_sorted(capture_trace_chroma_values, 0.95);
+        const auto chroma_validation_failed =
+            capture_trace_chroma_avg > MecchaCamouflage::Core::MaxCaptureTraceChromaAvg ||
+            capture_trace_chroma_p95 > MecchaCamouflage::Core::MaxCaptureTraceChromaP95;
 
         if (static_cast<int>(paint_seeds.size()) < min_paint_hits)
         {
@@ -7397,7 +9427,10 @@ namespace
             color_summary.clear_suspect,
             bulk_capture.image.bulk_calibration_best_median,
             capture_trace_chroma_avg,
-            capture_trace_chroma_p95});
+            capture_trace_chroma_p95,
+            capture_rgb_max,
+            color_quality.rgb_range,
+            color_quality.luma_range});
         if (!quality_decision.ok)
         {
             state.failures = 1;
@@ -7410,9 +9443,22 @@ namespace
                                   capture_trace_chroma_p95,
                                   nullptr,
                                   0,
-                                  0);
+                                  0,
+                                  nullptr,
+                                  0,
+                                  0,
+                                  nullptr,
+                                  0,
+                                  0,
+                                  export_ms,
+                                  seed_ms,
+                                  0.0,
+                                  0.0,
+                                  chroma_validation_failed,
+                                  material_scalar_values > 0 ? "scalar_parameter" : "preserved_original",
+                                  material_scalar_values > 0 ? "scalar_or_preserved" : "existing_channel");
             RC::Output::send<RC::LogLevel::Warning>(
-                STR("{} play screen_body refused reason={} validation_failed=1 failure={} readback_backend={} bulk_best_median={} capture_trace_chroma_avg={} capture_trace_chroma_p95={} thresholds=({}, {}, {}) background_pixels={} trace_hits={} min_samples={} no_import=1 no_clear=1 no_commit=1 no_mesh_hide=1 fallback_used=0 side_enabled=0\n"),
+                STR("{} play screen_body refused reason={} validation_failed=1 failure={} readback_backend={} bulk_best_median={} capture_trace_chroma_avg={} capture_trace_chroma_p95={} thresholds=({}, {}, {}) background_pixels={} trace_hits={} min_samples={} low_luma_suspect={} chroma_validation_failed={} capture_rgb_max={} capture_rgb_range={} capture_luma_range={} no_import=1 no_clear=1 no_commit=1 no_mesh_hide=1 fallback_used=0 side_enabled=0 job_stage=quality_gate\n"),
                 ModTag,
                 reason.empty() ? STR("<none>") : reason,
                 state.last_failure,
@@ -7425,10 +9471,16 @@ namespace
                 MecchaCamouflage::Core::MaxCaptureTraceChromaP95,
                 color_summary.pixels,
                 trace_background_hits,
-                min_paint_hits);
+                min_paint_hits,
+                low_luma_suspect ? 1 : 0,
+                chroma_validation_failed ? 1 : 0,
+                capture_rgb_max,
+                color_quality.rgb_range,
+                color_quality.luma_range);
             return false;
         }
 
+        const auto side_start = SteadyClock::now();
         BrushQuerySideStats side_stats{};
         auto side_samples = collect_brush_query_side_samples(component,
                                                              pawn,
@@ -7441,6 +9493,7 @@ namespace
                                                              paint_seeds,
                                                              state,
                                                              side_stats);
+        const auto side_ms = elapsed_ms_since(side_start);
         state.side_query_attempts = side_stats.attempts;
         state.side_query_success = side_stats.success;
         state.side_query_uv_hits = side_stats.uv_hits;
@@ -7450,7 +9503,18 @@ namespace
         state.side_nearest_sources = side_stats.nearest_sources;
         state.side_duplicate_texels = side_stats.duplicate_texels;
         state.side_normal_suspect = side_stats.normal_suspect;
-        constexpr int min_side_seeds = 64;
+        state.side_budget_exhausted = side_stats.budget_exhausted ? 1 : 0;
+        const auto side_acceptance_policy = MecchaCamouflage::Core::choose_adaptive_sampling_policy(MecchaCamouflage::Core::AdaptiveSamplingInput{
+            viewport.width,
+            viewport.height,
+            albedo_before.width,
+            albedo_before.height,
+            bbox_w_px,
+            bbox_h_px,
+            static_cast<int>(paint_seeds.size()),
+            side_stats.duplicate_texels,
+            side_stats.attempts});
+        const auto min_side_seeds = side_acceptance_policy.min_side_seeds;
         if (static_cast<int>(side_samples.size()) >= min_side_seeds)
         {
             state.side_enabled = 1;
@@ -7465,7 +9529,7 @@ namespace
             side_samples.clear();
         }
         RC::Output::send<RC::LogLevel::Warning>(
-            STR("{} side screen_space_brush_query_v1 enabled={} query={} attempts={} success={} owner_hits={} uv_hits={} projected_pixels={} frame_projected_pixels={} nearest_sources={} material_hits={} seeds={} duplicate_texels={} normal_suspect={} out_of_view={} no_color={} min_side_seeds={} first_failure={}\n"),
+            STR("{} side screen_space_brush_query_v1 enabled={} query={} attempts={} success={} owner_hits={} uv_hits={} projected_pixels={} frame_projected_pixels={} nearest_sources={} material_hits={} seeds={} duplicate_texels={} normal_suspect={} out_of_view={} no_color={} min_side_seeds={} t_side_ms={} budget_exhausted={} job_stage=side_query first_failure={}\n"),
             ModTag,
             state.side_enabled,
             side_stats.query_name.empty() ? STR("<none>") : side_stats.query_name,
@@ -7483,11 +9547,17 @@ namespace
             side_stats.out_of_view,
             side_stats.no_color,
             min_side_seeds,
+            side_ms,
+            side_stats.budget_exhausted ? 1 : 0,
             side_stats.first_failure.empty() ? STR("<none>") : side_stats.first_failure);
 
         const auto atlas_start = SteadyClock::now();
         std::vector<MecchaCamouflage::Core::PaintSeed> core_seeds{};
         core_seeds.reserve(paint_seeds.size() + side_samples.size());
+        const auto adaptive_seed_radius = MecchaCamouflage::Core::estimate_seed_radius_for_density(
+            albedo_before.width,
+            albedo_before.height,
+            static_cast<int>(paint_seeds.size() + side_samples.size()));
         for (const auto& seed : paint_seeds)
         {
             core_seeds.push_back(MecchaCamouflage::Core::PaintSeed{
@@ -7501,7 +9571,7 @@ namespace
                     seed.color.metallic},
                 seed.floor_like,
                 seed.floor_like ? 12 : 11,
-                2,
+                adaptive_seed_radius,
                 seed.floor_like ? 88.0 : 72.0});
         }
         for (const auto& sample : side_samples)
@@ -7517,7 +9587,7 @@ namespace
                     sample.color.metallic},
                 sample.floor_like,
                 sample.floor_like ? 8 : 7,
-                5,
+                adaptive_seed_radius,
                 sample.floor_like ? 48.0 : 42.0});
         }
         const auto assembled_texture = MecchaCamouflage::Core::assemble_direct_texture(
@@ -7528,10 +9598,88 @@ namespace
         auto albedo_target = assembled_texture.albedo.bytes;
         auto metallic_target = assembled_texture.metallic.bytes;
         auto roughness_target = assembled_texture.roughness.bytes;
+        constexpr bool import_material_channels = false;
+        if (!import_material_channels)
+        {
+            metallic_target = metallic_before.bytes;
+            roughness_target = roughness_before.bytes;
+        }
         const auto write_stats = assembled_texture.stats;
         const auto direct_texel_count = write_stats.direct_texels;
         const auto worker_count = write_stats.worker_threads;
         const auto atlas_ms = elapsed_ms_since(atlas_start);
+
+        const auto coverage_report = MecchaCamouflage::Core::evaluate_uv_coverage(MecchaCamouflage::Core::UvCoverageInput{
+            albedo_before.width,
+            albedo_before.height,
+            write_stats.uv_coverage,
+            direct_texel_count,
+            static_cast<int>(side_samples.size()),
+            side_stats.budget_exhausted,
+            side_stats.duplicate_texels,
+            side_stats.attempts});
+        RC::Output::send<RC::LogLevel::Warning>(
+            STR("{} coverage_report ok={} failure={} texture_size={}x{} uv_coverage={} direct_texels={} coverage_ratio={} direct_ratio={} side_seeds={} side_budget_exhausted={} duplicate_rate={} duplicate_limited={} side_exhausted_low_coverage={} no_import={} job_stage=coverage_gate\n"),
+            ModTag,
+            coverage_report.ok ? 1 : 0,
+            RC::ensure_str(coverage_report.failure.c_str()),
+            albedo_before.width,
+            albedo_before.height,
+            write_stats.uv_coverage,
+            direct_texel_count,
+            coverage_report.coverage_ratio,
+            coverage_report.direct_ratio,
+            static_cast<int>(side_samples.size()),
+            side_stats.budget_exhausted ? 1 : 0,
+            coverage_report.duplicate_rate,
+            coverage_report.duplicate_limited ? 1 : 0,
+            coverage_report.side_exhausted_low_coverage ? 1 : 0,
+            coverage_report.ok ? 0 : 1);
+        if (!coverage_report.ok)
+        {
+            state.failures = 1;
+            state.success = 0;
+            state.paint_uv_success = 0;
+            state.verified_visible_backend = false;
+            state.verified_paint_function = STR("ImportChannelFromBytes.coverage_refused");
+            state.last_failure = RC::ensure_str(coverage_report.failure.c_str());
+            write_debug_artifacts("coverage_validation_failed",
+                                  state.last_failure,
+                                  false,
+                                  capture_trace_chroma_avg,
+                                  capture_trace_chroma_p95,
+                                  &albedo_target,
+                                  albedo_before.width,
+                                  albedo_before.height,
+                                  &metallic_target,
+                                  metallic_before.width,
+                                  metallic_before.height,
+                                  &roughness_target,
+                                  roughness_before.width,
+                                  roughness_before.height,
+                                  export_ms,
+                                  seed_ms,
+                                  atlas_ms,
+                                  0.0,
+                                  chroma_validation_failed,
+                                  import_material_channels && material_scalar_values > 0 ? "scalar_parameter" : "preserved_original",
+                                  import_material_channels && material_scalar_values > 0 ? "scalar_or_preserved" : "existing_channel",
+                                  side_ms);
+            RC::Output::send<RC::LogLevel::Warning>(
+                STR("{} play screen_body refused reason={} failure={} coverage_ratio={} direct_ratio={} uv_coverage={} texture_size={}x{} side_seeds={} side_budget_exhausted={} duplicate_rate={} no_import=1 no_clear=1 no_commit=1 no_mesh_hide=1 fallback_used=0 job_stage=coverage_gate\n"),
+                ModTag,
+                reason.empty() ? STR("<none>") : reason,
+                state.last_failure,
+                coverage_report.coverage_ratio,
+                coverage_report.direct_ratio,
+                write_stats.uv_coverage,
+                albedo_before.width,
+                albedo_before.height,
+                static_cast<int>(side_samples.size()),
+                side_stats.budget_exhausted ? 1 : 0,
+                coverage_report.duplicate_rate);
+            return false;
+        }
 
         const auto import_start = SteadyClock::now();
         const auto hash_before = hash_component_paint_state(component);
@@ -7551,14 +9699,32 @@ namespace
                               capture_trace_chroma_p95,
                               &albedo_target,
                               albedo_before.width,
-                              albedo_before.height);
+                              albedo_before.height,
+                              &metallic_target,
+                              metallic_before.width,
+                              metallic_before.height,
+                              &roughness_target,
+                              roughness_before.width,
+                              roughness_before.height,
+                              export_ms,
+                              seed_ms,
+                              atlas_ms,
+                              0.0,
+                              chroma_validation_failed,
+                              import_material_channels && material_scalar_values > 0 ? "scalar_parameter" : "preserved_original",
+                              import_material_channels && material_scalar_values > 0 ? "scalar_or_preserved" : "existing_channel",
+                              side_ms);
 
         StringType albedo_import_failure{};
         StringType metallic_import_failure{};
         StringType roughness_import_failure{};
         const auto albedo_import_ok = import_channel_bytes(component, 0, albedo_target, albedo_import_failure);
-        const auto metallic_import_ok = import_channel_bytes(component, 1, metallic_target, metallic_import_failure);
-        const auto roughness_import_ok = import_channel_bytes(component, 2, roughness_target, roughness_import_failure);
+        const auto metallic_import_ok = import_material_channels
+                                            ? import_channel_bytes(component, 1, metallic_target, metallic_import_failure)
+                                            : true;
+        const auto roughness_import_ok = import_material_channels
+                                             ? import_channel_bytes(component, 2, roughness_target, roughness_import_failure)
+                                             : true;
 
         const auto albedo_after = export_channel_bytes(component, 0);
         const auto metallic_after = export_channel_bytes(component, 1);
@@ -7593,7 +9759,7 @@ namespace
                                                   : STR("direct_only_no_side");
 
         RC::Output::send<RC::LogLevel::Warning>(
-            STR("{} play screen_body result reason={} success={} visible_backend={} queued_strokes=0 import_backend=1 albedo_import_ok={} albedo_observed={} metallic_import_ok={} metallic_observed={} roughness_import_ok={} roughness_observed={} missing_color={} hash_before={} hash_after={} hash_changed={} body_samples={} paint_seeds={} side_seeds={} target_samples={} min_samples={} hard_max_attempts={} coarse_hits={} refined_hits={} bbox_norm=({}, {})-({}, {}) bbox_px={}x{} refine_grid={}x{} rt_size={}x{} texture_size={}x{} uv_coverage={} filled_by_direct={} filled_by_extension={} filled_by_floor={} direct_texels={} edge_texels={} extruded_texels={} fallback_extruded_texels={} preserved_direct={} preserved_original={} worker_threads={} readback_backend={} trace_primary=1 no_scene_capture=0 texture_source_verified=1 capture_color_used={} trace_only_color_used={} capture_trace_pairs={} capture_trace_chroma_avg={} capture_trace_chroma_p95={} capture_trace_chroma_max={} selected_capture_fov={} capture_transform_backend={} capture_transform_scale=({}, {}) capture_transform_offset=({}, {}) capture_transform_flip=({}, {}) image_ok={} image_failure={} image_bulk_calibration_ok={} image_bulk_transform_flip=({}, {}) image_bulk_transform_scale=({}, {}) image_bulk_transform_offset=({}, {}) background_pixels={} capture_uniform={} capture_clear_suspect={} rgb_min=({}, {}, {}) rgb_avg=({}, {}, {}) rgb_max=({}, {}, {}) metallic_avg={} roughness_avg={} channel={} label=ImportChannelFromBytes first_failure={} t_hit_ms={} t_trace_ms={} t_alignment_ms={} t_capture_ms={} t_export_ms={} t_seed_ms={} t_atlas_ms={} t_import_ms={} t_total_ms={} frame_fov={} fov_source={} camera_fov={} deproject_hfov={} viewport={}x{} no_clear=1 no_commit=1 no_mesh_hide=1 no_palette_fallback=1 no_trace_color_fallback=1 fallback_used=0 side_enabled={} side_backend={} uv_extend=0 fill_mode={} direct_layer_priority=1\n"),
+            STR("{} play screen_body result reason={} success={} visible_backend={} queued_strokes=0 import_backend=1 replication_scope=local_only replicated_apply=0 albedo_import_ok={} albedo_observed={} metallic_import_ok={} metallic_observed={} roughness_import_ok={} roughness_observed={} material_channels_imported={} missing_color={} hash_before={} hash_after={} hash_changed={} body_samples={} paint_seeds={} side_seeds={} front_brush_seeds={} target_samples={} min_samples={} hard_max_attempts={} coarse_hits={} refined_hits={} bbox_norm=({}, {})-({}, {}) bbox_px={}x{} refine_grid={}x{} rt_size={}x{} texture_size={}x{} uv_coverage={} filled_by_direct={} filled_by_extension={} filled_by_floor={} direct_texels={} edge_texels={} extruded_texels={} fallback_extruded_texels={} preserved_direct={} preserved_original={} worker_threads={} readback_backend={} trace_primary=1 no_scene_capture=0 texture_source_verified=1 capture_color_used={} trace_only_color_used={} capture_trace_pairs={} capture_trace_chroma_avg={} capture_trace_chroma_p95={} capture_trace_chroma_max={} selected_capture_fov={} capture_transform_backend={} capture_transform_scale=({}, {}) capture_transform_offset=({}, {}) capture_transform_flip=({}, {}) image_ok={} image_failure={} image_bulk_calibration_ok={} image_bulk_transform_flip=({}, {}) image_bulk_transform_scale=({}, {}) image_bulk_transform_offset=({}, {}) background_pixels={} capture_uniform={} capture_clear_suspect={} rgb_min=({}, {}, {}) rgb_avg=({}, {}, {}) rgb_max=({}, {}, {}) metallic_avg={} roughness_avg={} channel={} label=ImportChannelFromBytes first_failure={} t_hit_ms={} t_trace_ms={} t_alignment_ms={} t_capture_ms={} t_export_ms={} t_seed_ms={} t_side_ms={} t_atlas_ms={} t_import_ms={} t_total_ms={} frame_fov={} fov_source={} camera_fov={} deproject_hfov={} viewport={}x{} no_clear=1 no_commit=1 no_mesh_hide=1 no_palette_fallback=1 no_trace_color_fallback=1 fallback_used=0 side_enabled={} side_backend={} uv_extend=0 fill_mode={} direct_layer_priority=1 job_stage=complete phase_ms=({}, {}, {}, {}, {}, {}, {}, {}) frame_budget_overrun={} readback_backend_cached={} exact_material_source=unavailable material_confidence={} material_source={} low_luma_suspect={} chroma_validation_failed={} side_budget_exhausted={} hit_budget_exhausted={}\n"),
             ModTag,
             reason.empty() ? STR("<none>") : reason,
             state.success,
@@ -7604,6 +9770,7 @@ namespace
             metallic_observed ? 1 : 0,
             roughness_import_ok ? 1 : 0,
             roughness_observed ? 1 : 0,
+            import_material_channels ? 1 : 0,
             missing_color,
             hash_before,
             hash_after,
@@ -7611,6 +9778,7 @@ namespace
             samples.size(),
             static_cast<int>(paint_seeds.size()),
             static_cast<int>(side_samples.size()),
+            front_brush_stats.seeds,
             target_paint_hits,
             min_paint_hits,
             hard_max_attempts,
@@ -7685,6 +9853,7 @@ namespace
             capture_ms,
             export_ms,
             seed_ms,
+            side_ms,
             atlas_ms,
             import_ms,
             total_ms,
@@ -7696,7 +9865,23 @@ namespace
             viewport.height,
             state.side_enabled,
             state.side_backend,
-            fill_mode);
+            fill_mode,
+            hit_ms,
+            trace_ms,
+            capture_ms,
+            export_ms,
+            seed_ms,
+            side_ms,
+            atlas_ms,
+            import_ms,
+            total_ms > 8.0 ? 1 : 0,
+            g_readback_backend_cache.valid ? 1 : 0,
+            import_material_channels && material_scalar_values > 0 ? STR("scalar_or_preserved") : STR("preserved_original"),
+            import_material_channels && material_scalar_values > 0 ? STR("scalar_parameter") : STR("existing_channel"),
+            low_luma_suspect ? 1 : 0,
+            chroma_validation_failed ? 1 : 0,
+            state.side_budget_exhausted,
+            refined_stats.budget_exhausted ? 1 : 0);
         RC::Output::send<RC::LogLevel::Verbose>(
             STR("{} play screen_body projection_material projected_ok={} projected_failed={} projected_out_of_view={} projected_delta_avg_px={} projected_delta_max_px={} trace_hits={} trace_misses={} trace_floor_hits={} trace_self_skips={} trace_channel_attempts={} trace_distance_avg={} trace_distance_max={} trace_forward_avg={} trace_right_avg={} trace_right_abs_avg={} trace_up_avg={} trace_up_abs_avg={} trace_project_samples={} trace_project_delta_avg_px={} trace_project_delta_max_px={} roughness_samples={} roughness_min={} roughness_avg={} roughness_max={} metallic_min={} metallic_avg={} metallic_max={} t_trace_ms={} readback_backend={}\n"),
             ModTag,
@@ -7764,6 +9949,13 @@ namespace
             ModVersion = STR("1.0.0");
             ModDescription = STR("In-engine camera-matched camouflage painter");
             ModAuthors = STR("meccha-camouflage");
+            register_tab(STR("MecchaCamouflage"), [](RC::CppUserModBase* instance) {
+                auto* mod = dynamic_cast<MecchaCamouflageMod*>(instance);
+                if (mod)
+                {
+                    mod->render_status_tab();
+                }
+            });
             RC::Output::send<RC::LogLevel::Verbose>(STR("{} constructed version={}\n"), ModTag, ModVersion);
         }
 
@@ -7791,8 +9983,86 @@ namespace
                                                     m_hotkey_registered ? 1 : 0);
         }
 
+        auto on_ui_init() -> void override
+        {
+            UE4SS_ENABLE_IMGUI();
+            m_imgui_initialized = true;
+            RC::Output::send<RC::LogLevel::Warning>(STR("{} ui_imgui initialized=1 tab=MecchaCamouflage\n"), ModTag);
+        }
+
       private:
+        enum class UiPipelineStage
+        {
+            Idle,
+            ResolveTarget,
+            RefinedHit,
+            Preflight,
+            AtlasProbe,
+            SurfaceTraceSampling,
+            SceneCaptureSupplement,
+            WorkerAssemble,
+            Apply,
+            Verify,
+            Done,
+        };
+
+        struct PendingPipelineJob
+        {
+            bool active{false};
+            UiPipelineStage stage{UiPipelineStage::Idle};
+            StringType reason{STR("model_runtime_paint_front_last")};
+            Unreal::UObject* pawn{nullptr};
+            Unreal::UObject* component{nullptr};
+            Unreal::UObject* mesh{nullptr};
+            Unreal::UObject* controller{nullptr};
+            ViewportInfo viewport{};
+            ProjectionFrame frame{};
+            bool use_normalized_coords{false};
+            ScreenHitCollectionStats coarse_stats{};
+            ScreenHitCollectionStats normalized_coarse_stats{};
+            ScreenHitCollectionStats refined_stats{};
+            std::vector<ScreenHitSample> samples{};
+            int refine_cursor{0};
+            int refine_total_cells{0};
+            int target_paint_hits{0};
+            int min_paint_hits{0};
+            int preferred_paint_hits{0};
+            int hard_max_attempts{0};
+            int refine_grid_x{0};
+            int refine_grid_y{0};
+            double min_nx{0.0};
+            double max_nx{1.0};
+            double min_ny{0.0};
+            double max_ny{1.0};
+            double bbox_w_px{0.0};
+            double bbox_h_px{0.0};
+            SteadyClock::time_point hit_start{};
+            SteadyClock::time_point job_start{};
+            SteadyClock::time_point stage_start{};
+            MecchaCamouflage::Core::RuntimeCapabilities capabilities{};
+            MecchaCamouflage::Core::RuntimeAtlasProbeReport atlas_probe{};
+            MecchaCamouflage::Core::ApplyBackendProbe apply_backend{};
+            MecchaCamouflage::Core::AtlasCoverageReport atlas_coverage{};
+            MecchaCamouflage::Core::SurfaceSampleEvidence surface_evidence{};
+            MecchaCamouflage::Core::ReplicatedStrokePlan stroke_plan{};
+            MecchaCamouflage::Core::PhaseTiming timing{};
+            RuntimePaintBrushSettings brush{};
+            std::vector<ScreenHitSample> apply_samples{};
+            int apply_cursor{0};
+            int replicated_strokes_sent{0};
+            int replicated_strokes_failed{0};
+            int local_echo_strokes{0};
+            int apply_frame_overruns{0};
+            StringType apply_rpc{STR("<none>")};
+            StringType local_echo_rpc{STR("<none>")};
+            bool frame_budget_overrun{false};
+            bool camera_state_restored{true};
+            bool preflight_done{false};
+            bool atlas_probe_done{false};
+        };
+
         ProbeState m_state{};
+        PendingPipelineJob m_pipeline_job{};
         Unreal::Hook::GlobalCallbackId m_ui_tick_hook_id{Unreal::Hook::ERROR_ID};
         bool m_ui_play_requested{false};
         bool m_ui_play_running{false};
@@ -7800,6 +10070,70 @@ namespace
         bool m_hotkey_registered{false};
         bool m_ui_tick_seen{false};
         int m_ui_tick_frames{0};
+        bool m_imgui_initialized{false};
+        std::atomic_bool m_imgui_request_pending{false};
+
+        auto render_status_tab() -> void
+        {
+            ImGui::Text("MecchaCamouflage");
+            ImGui::Separator();
+            ImGui::Text("Hotkey: F10");
+            ImGui::Text("ImGui initialized: %s", m_imgui_initialized ? "yes" : "no");
+            ImGui::Text("Game tick seen: %s", m_ui_tick_seen ? "yes" : "no");
+            ImGui::Text("Tick frames: %d", m_ui_tick_frames);
+            ImGui::Text("Job active: %s", m_pipeline_job.active ? "yes" : "no");
+            ImGui::Text("Stage: %S", ui_stage_name(m_pipeline_job.stage));
+            ImGui::Text("Play id: %llu", static_cast<unsigned long long>(m_state.play_id));
+            ImGui::Text("Success: %d", m_state.success);
+            ImGui::Text("Failures: %d", m_state.failures);
+            ImGui::Text("Last failure: %S", m_state.last_failure.c_str());
+            ImGui::Text("Current pawn: %S", m_state.current_pawn.empty() ? STR("<none>") : m_state.current_pawn.c_str());
+            ImGui::Text("Current component: %S",
+                        m_state.current_component.empty() ? STR("<none>") : m_state.current_component.c_str());
+            ImGui::Text("Body hits: %d", m_state.body_trace_hits);
+            ImGui::Text("UV hits: %d", m_state.uv_hits);
+            if (ImGui::Button("Request camouflage"))
+            {
+                m_imgui_request_pending.store(true, std::memory_order_release);
+                RC::Output::send<RC::LogLevel::Warning>(
+                    STR("{} ui_imgui request_button=1 pending=1 active_job={} running={} requested={}\n"),
+                    ModTag,
+                    m_pipeline_job.active ? 1 : 0,
+                    m_ui_play_running ? 1 : 0,
+                    m_ui_play_requested ? 1 : 0);
+            }
+        }
+
+        auto ui_stage_name(UiPipelineStage stage) const -> const CharType*
+        {
+            switch (stage)
+            {
+            case UiPipelineStage::Idle:
+                return STR("idle");
+            case UiPipelineStage::ResolveTarget:
+                return STR("resolve_target");
+            case UiPipelineStage::RefinedHit:
+                return STR("refined_hit");
+            case UiPipelineStage::Preflight:
+                return STR("preflight");
+            case UiPipelineStage::AtlasProbe:
+                return STR("atlas_probe");
+            case UiPipelineStage::SurfaceTraceSampling:
+                return STR("surface_trace_sampling");
+            case UiPipelineStage::SceneCaptureSupplement:
+                return STR("scene_capture_supplement");
+            case UiPipelineStage::WorkerAssemble:
+                return STR("worker_assemble");
+            case UiPipelineStage::Apply:
+                return STR("apply");
+            case UiPipelineStage::Verify:
+                return STR("verify");
+            case UiPipelineStage::Done:
+                return STR("done");
+            default:
+                return STR("unknown");
+            }
+        }
 
         auto register_camouflage_hotkey() -> void
         {
@@ -7865,6 +10199,15 @@ namespace
             }
 
             ++m_ui_tick_frames;
+            if (m_imgui_request_pending.exchange(false, std::memory_order_acq_rel))
+            {
+                request_camouflage_from_ui();
+            }
+            if (m_pipeline_job.active)
+            {
+                advance_pipeline_job();
+                return;
+            }
             run_pending_ui_camouflage();
         }
 
@@ -7927,14 +10270,15 @@ namespace
 
         auto request_camouflage_from_ui() -> void
         {
-            if (m_ui_play_running || m_ui_play_requested)
+            if (m_ui_play_running || m_ui_play_requested || m_pipeline_job.active)
             {
                 RC::Output::send<RC::LogLevel::Warning>(
-                    STR("{} job_request source=F10 ignored=busy clicks={} input_ok=1 running={} requested={}\n"),
+                    STR("{} job_request source=F10 ignored=busy clicks={} input_ok=1 running={} requested={} active_job={}\n"),
                     ModTag,
                     m_ui_clicks,
                     m_ui_play_running ? 1 : 0,
-                    m_ui_play_requested ? 1 : 0);
+                    m_ui_play_requested ? 1 : 0,
+                    m_pipeline_job.active ? 1 : 0);
                 return;
             }
             m_ui_play_requested = true;
@@ -7944,14 +10288,19 @@ namespace
 
         auto run_pending_ui_camouflage() -> void
         {
-            if (!m_ui_play_requested || m_ui_play_running)
+            if (!m_ui_play_requested || m_ui_play_running || m_pipeline_job.active)
             {
                 return;
             }
             m_ui_play_requested = false;
             m_ui_play_running = true;
             log_f10_target_state(STR("job_start"), m_state.play_id + 1);
-            run_play();
+            start_pipeline_job();
+            advance_pipeline_job();
+        }
+
+        auto finish_pipeline_job() -> void
+        {
             const bool target_resolve_ok = m_state.last_failure != STR("player_pawn_unavailable") &&
                                            m_state.last_failure != STR("runtime_paint_component_unavailable") &&
                                            m_state.last_failure != STR("play_screen_body_prereq_unavailable");
@@ -7968,9 +10317,1047 @@ namespace
                 m_state.last_failure);
             write_last_status_file("job_done", target_resolve_ok);
             m_ui_play_running = false;
+            m_pipeline_job = PendingPipelineJob{};
         }
 
-        auto run_play() -> void
+        auto start_pipeline_job() -> void
+        {
+            m_pipeline_job = PendingPipelineJob{};
+            m_pipeline_job.active = true;
+            m_pipeline_job.stage = UiPipelineStage::ResolveTarget;
+            m_pipeline_job.reason = STR("model_runtime_paint_front_last");
+            m_pipeline_job.job_start = SteadyClock::now();
+            m_pipeline_job.stage_start = m_pipeline_job.job_start;
+            g_deferred_refined_hit_cache = DeferredRefinedHitCache{};
+            g_readback_backend_cache = CachedReadbackBackend{};
+
+            m_state.queue_active = false;
+            m_state.cancelled = false;
+            ++m_state.play_id;
+            m_state.current_world.clear();
+            m_state.current_pawn.clear();
+            m_state.current_component.clear();
+            m_state.verified_visible_backend = false;
+            m_state.queued_strokes = 0;
+            m_state.success = 0;
+            m_state.failures = 0;
+            m_state.paint_uv_success = 0;
+            m_state.paint_world_success = 0;
+            m_state.commit_calls = 0;
+            m_state.side_budget_exhausted = 0;
+            m_state.verified_paint_function = STR("PaintAtScreenPosition.body_mask");
+            m_state.verified_paint_channel = PaintChannelAlbedoMetallicRoughness;
+
+            RC::Output::send<RC::LogLevel::Warning>(
+                STR("{} play started id={} version={} route=f10_v2_runtime_atlas backend=tick_bounded_runtime_probe actual_model_paint=1 viewport_resolution_capture=0 scene_capture_color=0 trace_primary=1 capture_alignment=disabled alignment_used=0 front_screen_paint=0 import_fallback=0 fallback_used=0 side_enabled=0 no_gui=1 no_umg_overlay=1 no_material_shader=1 no_clear=1 no_commit=1 no_mesh_hide=1 no_trace_color_fallback=1 legacy_splat_success=0 job_stage=started frame_budget_soft_ms=4 frame_budget_hard_ms=8 scheduler=v2_tick_state_machine atlas_source=runtime_probe atlas_probe_ok=0 apply_backend=unknown exact_material_source=unavailable material_confidence=unknown no_import=0 camera_state_restored=1 fresh_probe=1 cached_runtime_state_cleared=1\n"),
+                ModTag,
+                m_state.play_id,
+                ModVersion);
+        }
+
+        auto advance_pipeline_job() -> void
+        {
+            if (!m_pipeline_job.active)
+            {
+                return;
+            }
+
+            if (m_pipeline_job.stage == UiPipelineStage::ResolveTarget)
+            {
+                auto* pawn = find_player_pawn();
+                auto* component = pawn ? find_runtime_paint_component_for(pawn) : find_runtime_paint_object_with_uv();
+                if (!pawn || !component)
+                {
+                    m_state.failures = 1;
+                    m_state.last_failure = !pawn ? STR("player_pawn_unavailable") : STR("runtime_paint_component_unavailable");
+                    RC::Output::send<RC::LogLevel::Warning>(
+                        STR("{} play model_runtime_paint refused reason={} pawn={} component={} actual_model_paint=0 no_gui=1 no_import=1 no_clear=1 no_commit=1 no_mesh_hide=1 job_stage=resolve_target\n"),
+                        ModTag,
+                        m_state.last_failure,
+                        pawn ? pawn->GetFullName() : STR("<null>"),
+                        component ? component->GetFullName() : STR("<null>"));
+                    finish_pipeline_job();
+                    return;
+                }
+
+                auto* controller = find_player_controller_for_pawn(pawn);
+                auto* mesh = find_target_mesh_for_runtime_paint(component, pawn);
+                auto viewport = get_viewport_info(controller);
+                auto frame = controller ? make_projection_frame_from_deproject(controller, viewport, 0.0, 0.0)
+                                        : std::optional<ProjectionFrame>{};
+                if (!controller || !mesh || viewport.width <= 0 || viewport.height <= 0 || !frame)
+                {
+                    m_state.failures = 1;
+                    m_state.last_failure = STR("play_screen_body_prereq_unavailable");
+                    RC::Output::send<RC::LogLevel::Warning>(
+                        STR("{} play screen_body refused reason={} component={} pawn={} controller={} mesh={} viewport={}x{} frame={} no_import=1 no_clear=1 no_commit=1 no_mesh_hide=1 job_stage=resolve_target\n"),
+                        ModTag,
+                        m_pipeline_job.reason,
+                        component ? component->GetFullName() : STR("<null>"),
+                        pawn ? pawn->GetFullName() : STR("<null>"),
+                        controller ? controller->GetFullName() : STR("<null>"),
+                        mesh ? mesh->GetFullName() : STR("<null>"),
+                        viewport.width,
+                        viewport.height,
+                        frame ? 1 : 0);
+                    finish_pipeline_job();
+                    return;
+                }
+
+                if (auto* world = pawn->GetWorld())
+                {
+                    m_state.current_world = world->GetFullName();
+                }
+                m_state.current_pawn = pawn->GetFullName();
+                m_state.current_component = component->GetFullName();
+
+                m_pipeline_job.pawn = pawn;
+                m_pipeline_job.component = component;
+                m_pipeline_job.mesh = mesh;
+                m_pipeline_job.controller = controller;
+                m_pipeline_job.viewport = viewport;
+                m_pipeline_job.frame = *frame;
+                m_pipeline_job.hit_start = SteadyClock::now();
+                dev_notify_user(pawn, controller, STR("MecchaCamouflage: F10 received; probing runtime atlas"), 2.0);
+
+                if (DiagnosticsEnabled)
+                {
+                    RC::Output::send<RC::LogLevel::Warning>(
+                        STR("{} atlas_dump begin route=f10_v2_runtime_atlas pawn={} component={} mesh={} world={} job_stage=preflight fresh_probe=1 dump_cached=0\n"),
+                        ModTag,
+                        pawn->GetFullName(),
+                        component->GetFullName(),
+                        mesh->GetFullName(),
+                        pawn->GetWorld() ? pawn->GetWorld()->GetFullName() : STR("<null>"));
+                    log_atlas_probe_object_dump(STR("runtime_paint_component"), component);
+                    log_replicated_paint_function_structs(STR("runtime_paint_component"), component);
+                    log_atlas_probe_object_dump(STR("target_mesh"), mesh);
+                    log_atlas_probe_object_dump(STR("pawn"), pawn, 48, 48);
+                    if (auto* query = find_screen_space_brush_query_for_pawn(pawn))
+                    {
+                        log_atlas_probe_object_dump(STR("screen_space_brush_query"), query);
+                    }
+                    log_atlas_probe_related_object_refs(STR("runtime_paint_component"), component);
+                    log_atlas_probe_related_object_refs(STR("target_mesh"), mesh, 12);
+                    log_atlas_probe_safe_getters(STR("runtime_paint_component"), component);
+                    log_atlas_probe_safe_getters(STR("target_mesh"), mesh);
+                    RC::Output::send<RC::LogLevel::Warning>(
+                        STR("{} atlas_dump end route=f10_v2_runtime_atlas job_stage=preflight fresh_probe=1 dump_cached=0\n"),
+                        ModTag);
+                }
+
+                {
+                    const auto stage_start = SteadyClock::now();
+                    m_pipeline_job.capabilities = probe_v2_runtime_capabilities(m_pipeline_job.component,
+                                                                                 m_pipeline_job.mesh);
+                    m_pipeline_job.apply_backend =
+                        MecchaCamouflage::Core::choose_apply_backend(m_pipeline_job.capabilities, DiagnosticsEnabled);
+                    m_pipeline_job.timing.resolve_ms += elapsed_ms_since(stage_start);
+                    m_pipeline_job.preflight_done = true;
+                    RC::Output::send<RC::LogLevel::Warning>(
+                        STR("{} capability_probe route=f10_v2_runtime_atlas game_thread_tick={} runtime_atlas_probe={} mesh_paint_texture={} mesh_paint_uv_channel={} render_data_cpu_access={} skinned_pose_snapshot={} non_blocking_texture_update={} chunked_paint_api={} batched_reflected_paint_api={} import_channel_from_bytes={} paint_at_uv={} paint_at_uv_with_brush={} paint_stroke_uv={} server_paint_api={} multicast_paint_api={} texture_sync_api={} material_parameter_names={} dominant_material_patterns={} apply_backend={} apply_backend_ok={} blocking_only={} no_import={} fallback_used=0 job_stage=preflight phase_ms={} frame_budget_overrun=0 camera_state_restored={}\n"),
+                        ModTag,
+                        m_pipeline_job.capabilities.game_thread_tick ? 1 : 0,
+                        m_pipeline_job.capabilities.runtime_atlas_probe ? 1 : 0,
+                        m_pipeline_job.capabilities.mesh_paint_texture ? 1 : 0,
+                        m_pipeline_job.capabilities.mesh_paint_uv_channel ? 1 : 0,
+                        m_pipeline_job.capabilities.render_data_cpu_access ? 1 : 0,
+                        m_pipeline_job.capabilities.skinned_pose_snapshot ? 1 : 0,
+                        m_pipeline_job.capabilities.non_blocking_texture_update ? 1 : 0,
+                        m_pipeline_job.capabilities.chunked_paint_api ? 1 : 0,
+                        m_pipeline_job.capabilities.batched_reflected_paint_api ? 1 : 0,
+                        m_pipeline_job.capabilities.import_channel_from_bytes ? 1 : 0,
+                        m_pipeline_job.capabilities.paint_at_uv ? 1 : 0,
+                        m_pipeline_job.capabilities.paint_at_uv_with_brush ? 1 : 0,
+                        m_pipeline_job.capabilities.paint_stroke_uv ? 1 : 0,
+                        m_pipeline_job.capabilities.server_paint_api ? 1 : 0,
+                        m_pipeline_job.capabilities.multicast_paint_api ? 1 : 0,
+                        m_pipeline_job.capabilities.texture_sync_api ? 1 : 0,
+                        m_pipeline_job.capabilities.material_parameter_names ? 1 : 0,
+                        m_pipeline_job.capabilities.dominant_material_patterns ? 1 : 0,
+                        apply_backend_label(m_pipeline_job.apply_backend.backend),
+                        m_pipeline_job.apply_backend.ok ? 1 : 0,
+                        m_pipeline_job.apply_backend.blocking_only ? 1 : 0,
+                        m_pipeline_job.apply_backend.ok ? 0 : 1,
+                        m_pipeline_job.timing.resolve_ms,
+                        m_pipeline_job.camera_state_restored ? 1 : 0);
+                }
+
+                {
+                    const auto stage_start = SteadyClock::now();
+                    m_pipeline_job.atlas_probe = probe_v2_runtime_atlas(m_pipeline_job.component,
+                                                                         m_pipeline_job.mesh,
+                                                                         m_pipeline_job.capabilities);
+                    m_pipeline_job.timing.calibration_ms += elapsed_ms_since(stage_start);
+                    m_pipeline_job.atlas_probe_done = true;
+                    RC::Output::send<RC::LogLevel::Warning>(
+                        STR("{} atlas_probe route=f10_v2_runtime_atlas atlas_source={} atlas_probe_ok={} failure={} texture_size={}x{} valid_texels={} uv_chart_count={} uv_overlap_ratio={} overlap_texels={} degenerate_texels={} apply_backend={} exact_material_source=unavailable material_confidence=unknown material_source=unavailable no_import={} fallback_used=0 legacy_splat_success=0 per_chart_coverage=0 frame_budget_overrun=0 job_stage=atlas_probe phase_ms={} camera_state_restored={}\n"),
+                        ModTag,
+                        RC::ensure_str(m_pipeline_job.atlas_probe.source.c_str()),
+                        m_pipeline_job.atlas_probe.ok ? 1 : 0,
+                        RC::ensure_str(m_pipeline_job.atlas_probe.failure.c_str()),
+                        m_pipeline_job.atlas_probe.texture_width,
+                        m_pipeline_job.atlas_probe.texture_height,
+                        m_pipeline_job.atlas_probe.valid_texels,
+                        m_pipeline_job.atlas_probe.chart_count,
+                        m_pipeline_job.atlas_probe.overlap_ratio,
+                        m_pipeline_job.atlas_probe.overlap_texels,
+                        m_pipeline_job.atlas_probe.degenerate_texels,
+                        apply_backend_label(m_pipeline_job.apply_backend.backend),
+                        m_pipeline_job.atlas_probe.ok ? 0 : 1,
+                        m_pipeline_job.timing.calibration_ms,
+                        m_pipeline_job.camera_state_restored ? 1 : 0);
+                    if (!m_pipeline_job.atlas_probe.ok)
+                    {
+                        RC::Output::send<RC::LogLevel::Warning>(
+                            STR("{} atlas_probe diagnostic_only=1 continue_to_replicated_apply=1 failure={} no_apply=0 texture_import_used=0 fallback_used=0 apply_backend={} job_stage=atlas_probe\n"),
+                            ModTag,
+                            RC::ensure_str(m_pipeline_job.atlas_probe.failure.c_str()),
+                            apply_backend_label(m_pipeline_job.apply_backend.backend));
+                    }
+                }
+
+                const std::vector<std::optional<Color>> dummy_colors(1, Color{0.34, 0.36, 0.32, 0.96, 0.0});
+                auto coarse_samples = collect_screen_hit_samples(component,
+                                                                 pawn,
+                                                                 mesh,
+                                                                 controller,
+                                                                 viewport,
+                                                                 dummy_colors,
+                                                                 1,
+                                                                 1,
+                                                                 ScreenProjectionGridX,
+                                                                 ScreenProjectionGridY,
+                                                                 false,
+                                                                 m_state,
+                                                                 m_pipeline_job.coarse_stats,
+                                                                 0.0,
+                                                                 1.0,
+                                                                 0.0,
+                                                                 1.0,
+                                                                 0,
+                                                                 0,
+                                                                 false);
+                log_screen_hit_stats(STR("screen_body_coarse"), STR("viewport_pixels"), m_pipeline_job.coarse_stats);
+                if (coarse_samples.empty())
+                {
+                    auto normalized_coarse_samples = collect_screen_hit_samples(component,
+                                                                               pawn,
+                                                                               mesh,
+                                                                               controller,
+                                                                               viewport,
+                                                                               dummy_colors,
+                                                                               1,
+                                                                               1,
+                                                                               ScreenProjectionGridX,
+                                                                               ScreenProjectionGridY,
+                                                                               true,
+                                                                               m_state,
+                                                                               m_pipeline_job.normalized_coarse_stats,
+                                                                               0.0,
+                                                                               1.0,
+                                                                               0.0,
+                                                                               1.0,
+                                                                               0,
+                                                                               0,
+                                                                               false);
+                    log_screen_hit_stats(STR("screen_body_coarse"), STR("normalized_0_1"), m_pipeline_job.normalized_coarse_stats);
+                    if (!normalized_coarse_samples.empty())
+                    {
+                        m_pipeline_job.use_normalized_coords = true;
+                    }
+                }
+
+                auto& active_coarse_stats = m_pipeline_job.use_normalized_coords
+                                                ? m_pipeline_job.normalized_coarse_stats
+                                                : m_pipeline_job.coarse_stats;
+                if (active_coarse_stats.hit_uv_count <= 0)
+                {
+                    m_state.failures = 1;
+                    m_state.last_failure = STR("play_screen_body_no_body_hits");
+                    RC::Output::send<RC::LogLevel::Warning>(
+                        STR("{} play screen_body refused reason={} input_ok=1 target_resolve_ok=1 body_hits=0 coarse_attempts={} coarse_hits={} normalized_attempts={} normalized_hits={} first_failure={} normalized_first_failure={} no_import=1 no_clear=1 no_commit=1 no_mesh_hide=1 no_screen_projection_fallback=1 no_trace_color_fallback=1 job_stage=coarse_hit\n"),
+                        ModTag,
+                        m_pipeline_job.reason,
+                        m_pipeline_job.coarse_stats.attempts,
+                        m_pipeline_job.coarse_stats.hit_uv_count,
+                        m_pipeline_job.normalized_coarse_stats.attempts,
+                        m_pipeline_job.normalized_coarse_stats.hit_uv_count,
+                        m_pipeline_job.coarse_stats.first_failure.empty() ? STR("<none>") : m_pipeline_job.coarse_stats.first_failure,
+                        m_pipeline_job.normalized_coarse_stats.first_failure.empty() ? STR("<none>") : m_pipeline_job.normalized_coarse_stats.first_failure);
+                    finish_pipeline_job();
+                    return;
+                }
+
+                const auto pad_x = 0.012;
+                const auto pad_y = 0.018;
+                m_pipeline_job.min_nx = clamp(active_coarse_stats.min_nx - pad_x, 0.0, 1.0);
+                m_pipeline_job.max_nx = clamp(active_coarse_stats.max_nx + pad_x, 0.0, 1.0);
+                m_pipeline_job.min_ny = clamp(active_coarse_stats.min_ny - pad_y, 0.0, 1.0);
+                m_pipeline_job.max_ny = clamp(active_coarse_stats.max_ny + pad_y, 0.0, 1.0);
+                m_pipeline_job.bbox_w_px = std::max(1.0, (m_pipeline_job.max_nx - m_pipeline_job.min_nx) *
+                                                             static_cast<double>(viewport.width));
+                m_pipeline_job.bbox_h_px = std::max(1.0, (m_pipeline_job.max_ny - m_pipeline_job.min_ny) *
+                                                             static_cast<double>(viewport.height));
+                const auto sampling_policy = MecchaCamouflage::Core::choose_adaptive_sampling_policy(MecchaCamouflage::Core::AdaptiveSamplingInput{
+                    viewport.width,
+                    viewport.height,
+                    0,
+                    0,
+                    m_pipeline_job.bbox_w_px,
+                    m_pipeline_job.bbox_h_px,
+                    active_coarse_stats.hit_uv_count,
+                    0,
+                    active_coarse_stats.attempts});
+                m_pipeline_job.target_paint_hits = sampling_policy.target_front_hits;
+                m_pipeline_job.min_paint_hits = sampling_policy.min_front_hits;
+                m_pipeline_job.preferred_paint_hits = sampling_policy.preferred_front_hits;
+                m_pipeline_job.hard_max_attempts = sampling_policy.hard_max_attempts;
+                m_pipeline_job.refine_grid_x = sampling_policy.refine_grid_x;
+                m_pipeline_job.refine_grid_y = sampling_policy.refine_grid_y;
+                m_pipeline_job.refine_total_cells = m_pipeline_job.refine_grid_x * m_pipeline_job.refine_grid_y;
+                m_pipeline_job.samples.clear();
+                m_pipeline_job.samples.reserve(static_cast<size_t>(std::max(1, m_pipeline_job.target_paint_hits)));
+                RC::Output::send<RC::LogLevel::Warning>(
+                    STR("{} adaptive_sampling_policy viewport={}x{} bbox_px={}x{} target_front_hits={} preferred_front_hits={} min_front_hits={} hard_max_attempts={} refine_grid={}x{} target_side_seeds={} side_views={} side_grid={}x{} duplicate_limited={} job_stage=refined_hit scheduler=tick\n"),
+                    ModTag,
+                    viewport.width,
+                    viewport.height,
+                    m_pipeline_job.bbox_w_px,
+                    m_pipeline_job.bbox_h_px,
+                    m_pipeline_job.target_paint_hits,
+                    m_pipeline_job.preferred_paint_hits,
+                    m_pipeline_job.min_paint_hits,
+                    m_pipeline_job.hard_max_attempts,
+                    m_pipeline_job.refine_grid_x,
+                    m_pipeline_job.refine_grid_y,
+                    sampling_policy.target_side_seeds,
+                    sampling_policy.side_view_count,
+                    sampling_policy.side_grid_x,
+                    sampling_policy.side_grid_y,
+                    sampling_policy.duplicate_limited ? 1 : 0);
+                m_pipeline_job.stage = UiPipelineStage::RefinedHit;
+            }
+
+            if (m_pipeline_job.stage == UiPipelineStage::RefinedHit)
+            {
+                const std::vector<std::optional<Color>> dummy_colors(1, Color{0.34, 0.36, 0.32, 0.96, 0.0});
+                int next_cursor = m_pipeline_job.refine_cursor;
+                auto batch = collect_screen_hit_samples(m_pipeline_job.component,
+                                                        m_pipeline_job.pawn,
+                                                        m_pipeline_job.mesh,
+                                                        m_pipeline_job.controller,
+                                                        m_pipeline_job.viewport,
+                                                        dummy_colors,
+                                                        1,
+                                                        1,
+                                                        m_pipeline_job.refine_grid_x,
+                                                        m_pipeline_job.refine_grid_y,
+                                                        m_pipeline_job.use_normalized_coords,
+                                                        m_state,
+                                                        m_pipeline_job.refined_stats,
+                                                        m_pipeline_job.min_nx,
+                                                        m_pipeline_job.max_nx,
+                                                        m_pipeline_job.min_ny,
+                                                        m_pipeline_job.max_ny,
+                                                        m_pipeline_job.target_paint_hits,
+                                                        m_pipeline_job.hard_max_attempts,
+                                                        false,
+                                                        4.0,
+                                                        0,
+                                                        m_pipeline_job.refine_cursor,
+                                                        &next_cursor);
+                m_pipeline_job.refine_cursor = next_cursor;
+                m_pipeline_job.samples.insert(m_pipeline_job.samples.end(), batch.begin(), batch.end());
+                m_state.uv_hits = m_pipeline_job.refined_stats.hit_uv_count;
+                m_state.body_trace_hits = m_pipeline_job.refined_stats.hit_success;
+
+                const auto complete =
+                    static_cast<int>(m_pipeline_job.samples.size()) >= m_pipeline_job.target_paint_hits ||
+                    m_pipeline_job.refine_cursor >= m_pipeline_job.refine_total_cells ||
+                    (m_pipeline_job.hard_max_attempts > 0 &&
+                     m_pipeline_job.refined_stats.attempts >= m_pipeline_job.hard_max_attempts);
+                RC::Output::send<RC::LogLevel::Verbose>(
+                    STR("{} refined_hit_tick cursor={}/{} attempts={} samples={} target_samples={} min_samples={} batch={} frame_budget_overrun={} job_stage=refined_hit\n"),
+                    ModTag,
+                    m_pipeline_job.refine_cursor,
+                    m_pipeline_job.refine_total_cells,
+                    m_pipeline_job.refined_stats.attempts,
+                    m_pipeline_job.samples.size(),
+                    m_pipeline_job.target_paint_hits,
+                    m_pipeline_job.min_paint_hits,
+                    batch.size(),
+                    m_pipeline_job.refined_stats.budget_exhausted ? 1 : 0);
+                if (!complete)
+                {
+                    return;
+                }
+
+                log_screen_hit_stats(STR("screen_body_refined_deferred"),
+                                     m_pipeline_job.use_normalized_coords ? STR("normalized_0_1") : STR("viewport_pixels"),
+                                     m_pipeline_job.refined_stats);
+                if (static_cast<int>(m_pipeline_job.samples.size()) < m_pipeline_job.min_paint_hits && !DiagnosticsEnabled)
+                {
+                    m_state.failures = 1;
+                    m_state.last_failure = STR("play_screen_body_quality_insufficient");
+                    RC::Output::send<RC::LogLevel::Warning>(
+                        STR("{} play screen_body refused reason={} samples={} min_samples={} target_samples={} hard_max_attempts={} bbox_norm=({}, {})-({}, {}) bbox_px={}x{} refine_grid={}x{} hit_ms={} no_import=1 no_clear=1 no_commit=1 no_mesh_hide=1 fallback_used=0 job_stage=refined_hit frame_budget_overrun=0 hit_budget_exhausted={}\n"),
+                        ModTag,
+                        m_pipeline_job.reason,
+                        m_pipeline_job.samples.size(),
+                        m_pipeline_job.min_paint_hits,
+                        m_pipeline_job.target_paint_hits,
+                        m_pipeline_job.hard_max_attempts,
+                        m_pipeline_job.min_nx,
+                        m_pipeline_job.min_ny,
+                        m_pipeline_job.max_nx,
+                        m_pipeline_job.max_ny,
+                        m_pipeline_job.bbox_w_px,
+                        m_pipeline_job.bbox_h_px,
+                        m_pipeline_job.refine_grid_x,
+                        m_pipeline_job.refine_grid_y,
+                        elapsed_ms_since(m_pipeline_job.hit_start),
+                        m_pipeline_job.refined_stats.budget_exhausted ? 1 : 0);
+                    finish_pipeline_job();
+                    return;
+                }
+                if (static_cast<int>(m_pipeline_job.samples.size()) < m_pipeline_job.min_paint_hits)
+                {
+                    RC::Output::send<RC::LogLevel::Warning>(
+                        STR("{} play screen_body quality_partial_dev samples={} min_samples={} target_samples={} replicated_partial=1 quality_success=0 no_apply=0 fallback_used=0 job_stage=refined_hit\n"),
+                        ModTag,
+                        m_pipeline_job.samples.size(),
+                        m_pipeline_job.min_paint_hits,
+                        m_pipeline_job.target_paint_hits);
+                }
+
+                g_deferred_refined_hit_cache.valid = true;
+                g_deferred_refined_hit_cache.pawn_name = m_pipeline_job.pawn->GetFullName();
+                g_deferred_refined_hit_cache.component_name = m_pipeline_job.component->GetFullName();
+                g_deferred_refined_hit_cache.samples = m_pipeline_job.samples;
+                g_deferred_refined_hit_cache.stats = m_pipeline_job.refined_stats;
+                m_pipeline_job.apply_samples = m_pipeline_job.samples;
+                m_pipeline_job.timing.refined_hit_ms = elapsed_ms_since(m_pipeline_job.hit_start);
+                m_pipeline_job.stage = (m_pipeline_job.preflight_done && m_pipeline_job.atlas_probe_done)
+                                           ? UiPipelineStage::SurfaceTraceSampling
+                                           : UiPipelineStage::Preflight;
+                m_pipeline_job.stage_start = SteadyClock::now();
+                return;
+            }
+
+            if (m_pipeline_job.stage == UiPipelineStage::Preflight)
+            {
+                if (m_pipeline_job.preflight_done)
+                {
+                    m_pipeline_job.stage = m_pipeline_job.atlas_probe_done
+                                               ? UiPipelineStage::SurfaceTraceSampling
+                                               : UiPipelineStage::AtlasProbe;
+                    m_pipeline_job.stage_start = SteadyClock::now();
+                    return;
+                }
+                const auto stage_start = SteadyClock::now();
+                m_pipeline_job.capabilities = probe_v2_runtime_capabilities(m_pipeline_job.component,
+                                                                             m_pipeline_job.mesh);
+                m_pipeline_job.apply_backend =
+                    MecchaCamouflage::Core::choose_apply_backend(m_pipeline_job.capabilities, DiagnosticsEnabled);
+                m_pipeline_job.timing.resolve_ms += elapsed_ms_since(stage_start);
+                m_pipeline_job.preflight_done = true;
+                RC::Output::send<RC::LogLevel::Warning>(
+                    STR("{} capability_probe route=f10_v2_runtime_atlas game_thread_tick={} runtime_atlas_probe={} mesh_paint_texture={} mesh_paint_uv_channel={} render_data_cpu_access={} skinned_pose_snapshot={} non_blocking_texture_update={} chunked_paint_api={} batched_reflected_paint_api={} import_channel_from_bytes={} paint_at_uv={} paint_at_uv_with_brush={} paint_stroke_uv={} server_paint_api={} multicast_paint_api={} texture_sync_api={} material_parameter_names={} dominant_material_patterns={} apply_backend={} apply_backend_ok={} blocking_only={} no_import={} fallback_used=0 job_stage=preflight phase_ms={} frame_budget_overrun=0 camera_state_restored={}\n"),
+                    ModTag,
+                    m_pipeline_job.capabilities.game_thread_tick ? 1 : 0,
+                    m_pipeline_job.capabilities.runtime_atlas_probe ? 1 : 0,
+                    m_pipeline_job.capabilities.mesh_paint_texture ? 1 : 0,
+                    m_pipeline_job.capabilities.mesh_paint_uv_channel ? 1 : 0,
+                    m_pipeline_job.capabilities.render_data_cpu_access ? 1 : 0,
+                    m_pipeline_job.capabilities.skinned_pose_snapshot ? 1 : 0,
+                    m_pipeline_job.capabilities.non_blocking_texture_update ? 1 : 0,
+                    m_pipeline_job.capabilities.chunked_paint_api ? 1 : 0,
+                    m_pipeline_job.capabilities.batched_reflected_paint_api ? 1 : 0,
+                    m_pipeline_job.capabilities.import_channel_from_bytes ? 1 : 0,
+                    m_pipeline_job.capabilities.paint_at_uv ? 1 : 0,
+                    m_pipeline_job.capabilities.paint_at_uv_with_brush ? 1 : 0,
+                    m_pipeline_job.capabilities.paint_stroke_uv ? 1 : 0,
+                    m_pipeline_job.capabilities.server_paint_api ? 1 : 0,
+                    m_pipeline_job.capabilities.multicast_paint_api ? 1 : 0,
+                    m_pipeline_job.capabilities.texture_sync_api ? 1 : 0,
+                    m_pipeline_job.capabilities.material_parameter_names ? 1 : 0,
+                    m_pipeline_job.capabilities.dominant_material_patterns ? 1 : 0,
+                    apply_backend_label(m_pipeline_job.apply_backend.backend),
+                    m_pipeline_job.apply_backend.ok ? 1 : 0,
+                    m_pipeline_job.apply_backend.blocking_only ? 1 : 0,
+                    m_pipeline_job.apply_backend.ok ? 0 : 1,
+                    m_pipeline_job.timing.resolve_ms,
+                    m_pipeline_job.camera_state_restored ? 1 : 0);
+                m_pipeline_job.stage = UiPipelineStage::AtlasProbe;
+                m_pipeline_job.stage_start = SteadyClock::now();
+                return;
+            }
+
+            if (m_pipeline_job.stage == UiPipelineStage::AtlasProbe)
+            {
+                if (m_pipeline_job.atlas_probe_done)
+                {
+                    m_pipeline_job.stage = UiPipelineStage::SurfaceTraceSampling;
+                    m_pipeline_job.stage_start = SteadyClock::now();
+                    return;
+                }
+                const auto stage_start = SteadyClock::now();
+                m_pipeline_job.atlas_probe = probe_v2_runtime_atlas(m_pipeline_job.component,
+                                                                     m_pipeline_job.mesh,
+                                                                     m_pipeline_job.capabilities);
+                m_pipeline_job.timing.calibration_ms += elapsed_ms_since(stage_start);
+                m_pipeline_job.atlas_probe_done = true;
+                RC::Output::send<RC::LogLevel::Warning>(
+                    STR("{} atlas_probe route=f10_v2_runtime_atlas atlas_source={} atlas_probe_ok={} failure={} texture_size={}x{} valid_texels={} uv_chart_count={} uv_overlap_ratio={} overlap_texels={} degenerate_texels={} apply_backend={} exact_material_source=unavailable material_confidence=unknown material_source=unavailable no_import={} fallback_used=0 legacy_splat_success=0 per_chart_coverage=0 frame_budget_overrun=0 job_stage=atlas_probe phase_ms={} camera_state_restored={}\n"),
+                    ModTag,
+                    RC::ensure_str(m_pipeline_job.atlas_probe.source.c_str()),
+                    m_pipeline_job.atlas_probe.ok ? 1 : 0,
+                    RC::ensure_str(m_pipeline_job.atlas_probe.failure.c_str()),
+                    m_pipeline_job.atlas_probe.texture_width,
+                    m_pipeline_job.atlas_probe.texture_height,
+                    m_pipeline_job.atlas_probe.valid_texels,
+                    m_pipeline_job.atlas_probe.chart_count,
+                    m_pipeline_job.atlas_probe.overlap_ratio,
+                    m_pipeline_job.atlas_probe.overlap_texels,
+                    m_pipeline_job.atlas_probe.degenerate_texels,
+                    apply_backend_label(m_pipeline_job.apply_backend.backend),
+                    m_pipeline_job.atlas_probe.ok ? 0 : 1,
+                    m_pipeline_job.timing.calibration_ms,
+                    m_pipeline_job.camera_state_restored ? 1 : 0);
+                if (!m_pipeline_job.atlas_probe.ok)
+                {
+                    RC::Output::send<RC::LogLevel::Warning>(
+                        STR("{} atlas_probe diagnostic_only=1 continue_to_replicated_apply=1 reason={} failure={} no_apply=0 texture_import_used=0 fallback_used=0 legacy_splat_success=0 apply_backend={} atlas_source={} atlas_probe_ok=0 uv_chart_count={} uv_overlap_ratio={} per_chart_coverage=0 exact_material_source=unavailable material_confidence=unknown material_source=unavailable phase_ms=({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}) frame_budget_overrun=0 readback_backend_cached=0 camera_state_restored={} job_stage=atlas_probe\n"),
+                        ModTag,
+                        m_pipeline_job.reason.empty() ? STR("<none>") : m_pipeline_job.reason,
+                        RC::ensure_str(m_pipeline_job.atlas_probe.failure.c_str()),
+                        apply_backend_label(m_pipeline_job.apply_backend.backend),
+                        RC::ensure_str(m_pipeline_job.atlas_probe.source.c_str()),
+                        m_pipeline_job.atlas_probe.chart_count,
+                        m_pipeline_job.atlas_probe.overlap_ratio,
+                        m_pipeline_job.timing.resolve_ms,
+                        m_pipeline_job.timing.coarse_hit_ms,
+                        m_pipeline_job.timing.refined_hit_ms,
+                        m_pipeline_job.timing.background_trace_ms,
+                        m_pipeline_job.timing.capture_scene_ms,
+                        m_pipeline_job.timing.bulk_readback_ms,
+                        m_pipeline_job.timing.calibration_ms,
+                        m_pipeline_job.timing.side_query_ms,
+                        m_pipeline_job.timing.assembly_ms,
+                        m_pipeline_job.timing.import_ms,
+                        m_pipeline_job.timing.verify_ms,
+                        m_pipeline_job.camera_state_restored ? 1 : 0);
+                }
+                m_pipeline_job.stage = UiPipelineStage::SurfaceTraceSampling;
+                m_pipeline_job.stage_start = SteadyClock::now();
+                return;
+            }
+
+            if (m_pipeline_job.stage == UiPipelineStage::SurfaceTraceSampling)
+            {
+                const auto surface_stage_start = SteadyClock::now();
+                m_pipeline_job.surface_evidence = MecchaCamouflage::Core::SurfaceSampleEvidence{};
+                m_pipeline_job.atlas_coverage = MecchaCamouflage::Core::evaluate_atlas_coverage(MecchaCamouflage::Core::AtlasCoverageInput{
+                    m_pipeline_job.atlas_probe.texture_width,
+                    m_pipeline_job.atlas_probe.texture_height,
+                    m_pipeline_job.atlas_probe.valid_texels,
+                    0,
+                    0,
+                    m_pipeline_job.atlas_probe.chart_count,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0});
+                auto* albedo_render_target_for_sizing = get_render_target_for_channel(m_pipeline_job.component, 0);
+                const auto [paint_texture_width_for_capture, paint_texture_height_for_capture] =
+                    render_target_dimensions(albedo_render_target_for_sizing);
+                const auto capture_sizing = MecchaCamouflage::Core::choose_capture_dimensions(MecchaCamouflage::Core::CaptureSizingInput{
+                    m_pipeline_job.viewport.width,
+                    m_pipeline_job.viewport.height,
+                    paint_texture_width_for_capture,
+                    paint_texture_height_for_capture,
+                    0});
+                const auto rt_width = std::max(1, capture_sizing.width);
+                const auto rt_height = std::max(1, capture_sizing.height);
+                const auto look_at = add(m_pipeline_job.frame.eye, mul(m_pipeline_job.frame.forward, 1000.0));
+                ScreenTransform capture_transform{};
+                RC::Output::send<RC::LogLevel::Warning>(
+                    STR("{} capability_probe capture_backend=ue_render_target capture_resolution_source={} viewport={}x{} rt_size={}x{} capture_scale={} failed_attempts=0 job_stage=surface_trace_sampling color_source=hidden_character_capture\n"),
+                    ModTag,
+                    RC::ensure_str(capture_sizing.reason.c_str()),
+                    m_pipeline_job.viewport.width,
+                    m_pipeline_job.viewport.height,
+                    rt_width,
+                    rt_height,
+                    capture_sizing.scale);
+
+                const auto hidden_capture_start = SteadyClock::now();
+                auto hidden_capture = capture_render_target_image(m_pipeline_job.pawn,
+                                                                  m_pipeline_job.frame.eye,
+                                                                  look_at,
+                                                                  rt_width,
+                                                                  rt_height,
+                                                                  true,
+                                                                  m_state,
+                                                                  m_pipeline_job.frame.fov_degrees,
+                                                                  m_pipeline_job.frame.has_rotation
+                                                                      ? &m_pipeline_job.frame.rotation
+                                                                      : nullptr,
+                                                                  &m_pipeline_job.apply_samples,
+                                                                  &capture_transform,
+                                                                  48);
+                m_pipeline_job.timing.capture_scene_ms += hidden_capture.capture_ms;
+                m_pipeline_job.timing.bulk_readback_ms += hidden_capture.readback_ms;
+                std::vector<std::optional<Color>> hidden_background_colors(m_pipeline_job.apply_samples.size());
+                if (hidden_capture.image.ok && hidden_capture.image.bulk_calibration_ok)
+                {
+                    hidden_background_colors = sample_hidden_background_from_image(hidden_capture.image,
+                                                                                   m_pipeline_job.apply_samples,
+                                                                                   hidden_capture.image.bulk_to_pixel_transform);
+                }
+
+                std::vector<ScreenHitSample> captured_samples{};
+                captured_samples.reserve(m_pipeline_job.apply_samples.size());
+                int capture_color_used = 0;
+                int missing_color = 0;
+                for (size_t i = 0; i < m_pipeline_job.apply_samples.size(); ++i)
+                {
+                    if (i >= hidden_background_colors.size() || !hidden_background_colors[i])
+                    {
+                        ++missing_color;
+                        continue;
+                    }
+                    auto sample = m_pipeline_job.apply_samples[i];
+                    auto color = *hidden_background_colors[i];
+                    if (!std::isfinite(color.r) || !std::isfinite(color.g) || !std::isfinite(color.b))
+                    {
+                        ++missing_color;
+                        continue;
+                    }
+                    color.r = clamp(color.r, 0.01, 0.99);
+                    color.g = clamp(color.g, 0.01, 0.99);
+                    color.b = clamp(color.b, 0.01, 0.99);
+                    sample.color = color;
+                    captured_samples.push_back(sample);
+                    ++capture_color_used;
+                }
+                const auto color_summary = summarize_capture_colors(hidden_background_colors);
+                const auto color_quality = summarize_capture_quality(hidden_background_colors);
+                const auto capture_rgb_max = std::max({color_summary.max_r, color_summary.max_g, color_summary.max_b});
+                const auto quality_decision = MecchaCamouflage::Core::validate_capture_quality(MecchaCamouflage::Core::CaptureQualityInput{
+                    hidden_capture.image.ok,
+                    hidden_capture.image.bulk_calibration_ok,
+                    color_summary.pixels,
+                    capture_color_used,
+                    m_pipeline_job.min_paint_hits,
+                    color_summary.uniform,
+                    color_summary.clear_suspect,
+                    hidden_capture.image.bulk_calibration_best_median,
+                    0.0,
+                    0.0,
+                    capture_rgb_max,
+                    color_quality.rgb_range,
+                    color_quality.luma_range});
+                const auto low_luma_suspect =
+                    capture_rgb_max < MecchaCamouflage::Core::MinCaptureRgbMax ||
+                    (color_quality.rgb_range < MecchaCamouflage::Core::MinCaptureRgbRange &&
+                     color_quality.luma_range < MecchaCamouflage::Core::MinCaptureLumaRange);
+                RC::Output::send<RC::LogLevel::Warning>(
+                    STR("{} hidden_background_capture color_source=hidden_character_capture image_ok={} image_failure={} bulk_calibration_ok={} bulk_backend={} bulk_pairs={} bulk_best_median={} bulk_runner_up_median={} capture_color_used={} missing_color={} background_pixels={} min_pixels={} uniform={} clear_suspect={} near_uniform={} low_luma_suspect={} chroma_validation_failed=0 rgb_min=({}, {}, {}) rgb_avg=({}, {}, {}) rgb_max=({}, {}, {}) color_score={} avg_chroma={} luma_range={} rgb_range={} capture_ms={} readback_ms={} total_ms={} readback_backend_cached={} no_trace_color_fallback=1 fallback_used=0 texture_import_used=0 job_stage=surface_trace_sampling\n"),
+                    ModTag,
+                    hidden_capture.image.ok ? 1 : 0,
+                    hidden_capture.image.failure.empty() ? STR("<none>") : hidden_capture.image.failure,
+                    hidden_capture.image.bulk_calibration_ok ? 1 : 0,
+                    hidden_capture.image.bulk_calibration_backend.empty()
+                        ? STR("<none>")
+                        : hidden_capture.image.bulk_calibration_backend,
+                    hidden_capture.image.bulk_calibration_pairs,
+                    hidden_capture.image.bulk_calibration_best_median,
+                    hidden_capture.image.bulk_calibration_runner_up_median,
+                    capture_color_used,
+                    missing_color,
+                    color_summary.pixels,
+                    m_pipeline_job.min_paint_hits,
+                    color_summary.uniform ? 1 : 0,
+                    color_summary.clear_suspect ? 1 : 0,
+                    color_summary.near_uniform_samples,
+                    low_luma_suspect ? 1 : 0,
+                    color_summary.min_r,
+                    color_summary.min_g,
+                    color_summary.min_b,
+                    color_summary.avg_r,
+                    color_summary.avg_g,
+                    color_summary.avg_b,
+                    color_summary.max_r,
+                    color_summary.max_g,
+                    color_summary.max_b,
+                    color_quality.score,
+                    color_quality.avg_chroma,
+                    color_quality.luma_range,
+                    color_quality.rgb_range,
+                    hidden_capture.capture_ms,
+                    hidden_capture.readback_ms,
+                    elapsed_ms_since(hidden_capture_start),
+                    g_readback_backend_cache.valid ? 1 : 0);
+                if (!quality_decision.ok || captured_samples.empty())
+                {
+                    m_state.failures = 1;
+                    m_state.success = 0;
+                    m_state.paint_uv_success = 0;
+                    m_state.verified_visible_backend = false;
+                    m_state.verified_paint_function = STR("replicated_paint.hidden_capture_refused");
+                    m_state.last_failure = captured_samples.empty()
+                                               ? STR("hidden_background_capture_empty_no_apply")
+                                               : RC::ensure_str(quality_decision.failure.c_str());
+                    RC::Output::send<RC::LogLevel::Warning>(
+                        STR("{} play replicated_paint refused reason={} failure={} no_apply=1 texture_import_used=0 import_backend=0 replicated_apply=0 fallback_used=0 legacy_splat_success=0 apply_backend={} atlas_source={} atlas_probe_ok={} uv_chart_count={} uv_overlap_ratio={} per_chart_coverage={} exact_material_source=unavailable material_confidence=unknown material_source=hidden_character_capture_rgb_estimated color_source=hidden_character_capture phase_ms=({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}) frame_budget_overrun=0 readback_backend_cached={} camera_state_restored={} job_stage=surface_trace_sampling\n"),
+                        ModTag,
+                        m_pipeline_job.reason.empty() ? STR("<none>") : m_pipeline_job.reason,
+                        m_state.last_failure,
+                        apply_backend_label(m_pipeline_job.apply_backend.backend),
+                        RC::ensure_str(m_pipeline_job.atlas_probe.source.c_str()),
+                        m_pipeline_job.atlas_probe.ok ? 1 : 0,
+                        m_pipeline_job.atlas_probe.chart_count,
+                        m_pipeline_job.atlas_probe.overlap_ratio,
+                        m_pipeline_job.atlas_coverage.min_chart_coverage,
+                        m_pipeline_job.timing.resolve_ms,
+                        m_pipeline_job.timing.coarse_hit_ms,
+                        m_pipeline_job.timing.refined_hit_ms,
+                        m_pipeline_job.timing.background_trace_ms,
+                        m_pipeline_job.timing.capture_scene_ms,
+                        m_pipeline_job.timing.bulk_readback_ms,
+                        m_pipeline_job.timing.calibration_ms,
+                        m_pipeline_job.timing.side_query_ms,
+                        m_pipeline_job.timing.assembly_ms,
+                        m_pipeline_job.timing.import_ms,
+                        m_pipeline_job.timing.verify_ms,
+                        g_readback_backend_cache.valid ? 1 : 0,
+                        m_pipeline_job.camera_state_restored ? 1 : 0);
+                    finish_pipeline_job();
+                    return;
+                }
+
+                m_pipeline_job.apply_samples = std::move(captured_samples);
+                m_pipeline_job.surface_evidence.scene_capture_samples = capture_color_used;
+                m_pipeline_job.surface_evidence.accepted_samples = capture_color_used;
+                m_pipeline_job.surface_evidence.rejected_samples = missing_color;
+                m_pipeline_job.timing.background_trace_ms += elapsed_ms_since(surface_stage_start);
+                m_pipeline_job.brush =
+                    resolve_runtime_paint_brush_settings(m_pipeline_job.component,
+                                                         static_cast<int>(m_pipeline_job.apply_samples.size()));
+                const auto max_replicated_strokes_per_tick =
+                    read_int_property_by_name(m_pipeline_job.component, STR("MaxReplicatedPaintStrokesPerTick")).value_or(24);
+                m_pipeline_job.stroke_plan =
+                    MecchaCamouflage::Core::plan_replicated_stroke_apply(MecchaCamouflage::Core::ReplicatedStrokePlanInput{
+                        static_cast<int>(m_pipeline_job.apply_samples.size()),
+                        m_pipeline_job.min_paint_hits,
+                        max_replicated_strokes_per_tick,
+                        DiagnosticsEnabled,
+                        m_pipeline_job.apply_backend.ok});
+                RC::Output::send<RC::LogLevel::Warning>(
+                    STR("{} surface_sampling route=f10_v2_runtime_atlas accepted_samples={} rejected_samples={} material_resolved_samples={} scene_capture_samples={} exact_material_source=unavailable material_confidence={} material_source=hidden_character_capture_rgb_estimated color_source=hidden_character_capture atlas_source={} atlas_probe_ok={} coverage_ok={} coverage_failure={} valid_coverage={} direct_coverage={} inferred_coverage={} per_chart_coverage={} lower_body_undercovered={} side_undercovered={} back_undercovered={} apply_backend={} apply_backend_ok={} apply_rpc=ServerSendPaint_or_ServerPaint local_echo_rpc=PaintAtUVWithBrush replicated_apply={} replicated_partial={} quality_success={} max_replicated_strokes_per_tick={} apply_mode=AlphaBlend brush_radius={} brush_seed_radius_px={} effective_brush_world_radius={} brush_texture_min_radius={} brush_texture_max_radius={} brush_hardness={} brush_opacity={} brush_spacing={} brush_falloff={} brush_blend_mode={} brush_template_resolution={} brush_subdivision_level={} brush_subdivision_pixel_size={} brush_max_generated_triangles={} brush_gutter_expand_pixels={} brush_source={} no_apply={} texture_import_used=0 fallback_used=0 legacy_splat_success=0 frame_budget_overrun=0 job_stage=surface_trace_sampling phase_ms={} camera_state_restored={}\n"),
+                    ModTag,
+                    m_pipeline_job.apply_samples.size(),
+                    m_pipeline_job.surface_evidence.rejected_samples,
+                    m_pipeline_job.surface_evidence.material_resolved_samples,
+                    m_pipeline_job.surface_evidence.scene_capture_samples,
+                    material_confidence_label(MecchaCamouflage::Core::MaterialConfidence::Unknown),
+                    RC::ensure_str(m_pipeline_job.atlas_probe.source.c_str()),
+                    m_pipeline_job.atlas_probe.ok ? 1 : 0,
+                    m_pipeline_job.atlas_coverage.ok ? 1 : 0,
+                    RC::ensure_str(m_pipeline_job.atlas_coverage.failure.c_str()),
+                    m_pipeline_job.atlas_coverage.valid_coverage_ratio,
+                    m_pipeline_job.atlas_coverage.direct_coverage_ratio,
+                    m_pipeline_job.atlas_coverage.inferred_coverage_ratio,
+                    m_pipeline_job.atlas_coverage.min_chart_coverage,
+                    m_pipeline_job.atlas_coverage.lower_body_undercovered ? 1 : 0,
+                    m_pipeline_job.atlas_coverage.side_undercovered ? 1 : 0,
+                    m_pipeline_job.atlas_coverage.back_undercovered ? 1 : 0,
+                    apply_backend_label(m_pipeline_job.apply_backend.backend),
+                    m_pipeline_job.apply_backend.ok ? 1 : 0,
+                    m_pipeline_job.stroke_plan.ok ? 1 : 0,
+                    m_pipeline_job.stroke_plan.partial ? 1 : 0,
+                    m_pipeline_job.stroke_plan.quality_success ? 1 : 0,
+                    m_pipeline_job.stroke_plan.strokes_per_tick,
+                    m_pipeline_job.brush.radius,
+                    m_pipeline_job.brush.seed_radius_px,
+                    m_pipeline_job.brush.effective_world_radius,
+                    m_pipeline_job.brush.texture_min_radius,
+                    m_pipeline_job.brush.texture_max_radius,
+                    m_pipeline_job.brush.hardness,
+                    m_pipeline_job.brush.opacity,
+                    m_pipeline_job.brush.spacing,
+                    m_pipeline_job.brush.falloff,
+                    m_pipeline_job.brush.blend_mode,
+                    m_pipeline_job.brush.template_resolution,
+                    m_pipeline_job.brush.subdivision_level,
+                    m_pipeline_job.brush.subdivision_pixel_size,
+                    m_pipeline_job.brush.max_generated_brush_triangles,
+                    m_pipeline_job.brush.gutter_expand_pixels,
+                    m_pipeline_job.brush.source,
+                    m_pipeline_job.stroke_plan.ok ? 0 : 1,
+                    m_pipeline_job.timing.background_trace_ms,
+                    m_pipeline_job.camera_state_restored ? 1 : 0);
+                if (!m_pipeline_job.stroke_plan.ok)
+                {
+                    m_state.failures = 1;
+                    m_state.success = 0;
+                    m_state.paint_uv_success = 0;
+                    m_state.verified_visible_backend = false;
+                    m_state.verified_paint_function = STR("replicated_paint_api.refused");
+                    m_state.last_failure = RC::ensure_str(m_pipeline_job.stroke_plan.failure.c_str());
+                    RC::Output::send<RC::LogLevel::Warning>(
+                        STR("{} play replicated_paint refused reason={} failure={} no_apply=1 texture_import_used=0 import_backend=0 replicated_apply=0 fallback_used=0 legacy_splat_success=0 apply_backend={} atlas_source={} atlas_probe_ok={} uv_chart_count={} uv_overlap_ratio={} per_chart_coverage={} exact_material_source=unavailable material_confidence=unknown material_source=hidden_character_capture_rgb_estimated color_source=hidden_character_capture phase_ms=({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}) frame_budget_overrun=0 readback_backend_cached={} camera_state_restored={} job_stage=surface_trace_sampling\n"),
+                        ModTag,
+                        m_pipeline_job.reason.empty() ? STR("<none>") : m_pipeline_job.reason,
+                        m_state.last_failure,
+                        apply_backend_label(m_pipeline_job.apply_backend.backend),
+                        RC::ensure_str(m_pipeline_job.atlas_probe.source.c_str()),
+                        m_pipeline_job.atlas_probe.ok ? 1 : 0,
+                        m_pipeline_job.atlas_probe.chart_count,
+                        m_pipeline_job.atlas_probe.overlap_ratio,
+                        m_pipeline_job.atlas_coverage.min_chart_coverage,
+                        m_pipeline_job.timing.resolve_ms,
+                        m_pipeline_job.timing.coarse_hit_ms,
+                        m_pipeline_job.timing.refined_hit_ms,
+                        m_pipeline_job.timing.background_trace_ms,
+                        m_pipeline_job.timing.capture_scene_ms,
+                        m_pipeline_job.timing.bulk_readback_ms,
+                        m_pipeline_job.timing.calibration_ms,
+                        m_pipeline_job.timing.side_query_ms,
+                        m_pipeline_job.timing.assembly_ms,
+                        m_pipeline_job.timing.import_ms,
+                        m_pipeline_job.timing.verify_ms,
+                        g_readback_backend_cache.valid ? 1 : 0,
+                        m_pipeline_job.camera_state_restored ? 1 : 0);
+                    finish_pipeline_job();
+                    return;
+                }
+
+                m_state.queued_strokes = static_cast<int>(m_pipeline_job.apply_samples.size());
+                m_pipeline_job.apply_cursor = 0;
+                m_pipeline_job.stage = UiPipelineStage::Apply;
+                m_pipeline_job.stage_start = SteadyClock::now();
+                return;
+
+                const auto stage_start = SteadyClock::now();
+                m_pipeline_job.surface_evidence = MecchaCamouflage::Core::SurfaceSampleEvidence{};
+                m_pipeline_job.atlas_coverage = MecchaCamouflage::Core::evaluate_atlas_coverage(MecchaCamouflage::Core::AtlasCoverageInput{
+                    m_pipeline_job.atlas_probe.texture_width,
+                    m_pipeline_job.atlas_probe.texture_height,
+                    m_pipeline_job.atlas_probe.valid_texels,
+                    0,
+                    0,
+                    m_pipeline_job.atlas_probe.chart_count,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0});
+                m_pipeline_job.timing.background_trace_ms += elapsed_ms_since(stage_start);
+                const auto failure = !m_pipeline_job.apply_backend.ok
+                                         ? m_pipeline_job.apply_backend.failure
+                                         : m_pipeline_job.atlas_coverage.failure;
+                m_state.failures = 1;
+                m_state.success = 0;
+                m_state.paint_uv_success = 0;
+                m_state.verified_visible_backend = false;
+                m_state.verified_paint_function = STR("v2_surface_material_sampling.refused");
+                m_state.last_failure = RC::ensure_str(failure.c_str());
+                RC::Output::send<RC::LogLevel::Warning>(
+                    STR("{} surface_sampling route=f10_v2_runtime_atlas accepted_samples={} rejected_samples={} material_resolved_samples={} scene_capture_samples={} exact_material_source=unavailable material_confidence={} material_source=unavailable atlas_source={} atlas_probe_ok=1 coverage_ok={} coverage_failure={} valid_coverage={} direct_coverage={} inferred_coverage={} per_chart_coverage={} lower_body_undercovered={} side_undercovered={} back_undercovered={} apply_backend={} apply_backend_ok={} no_import=1 fallback_used=0 legacy_splat_success=0 frame_budget_overrun=0 job_stage=surface_trace_sampling phase_ms={} camera_state_restored={}\n"),
+                    ModTag,
+                    m_pipeline_job.surface_evidence.accepted_samples,
+                    m_pipeline_job.surface_evidence.rejected_samples,
+                    m_pipeline_job.surface_evidence.material_resolved_samples,
+                    m_pipeline_job.surface_evidence.scene_capture_samples,
+                    material_confidence_label(MecchaCamouflage::Core::MaterialConfidence::Unknown),
+                    RC::ensure_str(m_pipeline_job.atlas_probe.source.c_str()),
+                    m_pipeline_job.atlas_coverage.ok ? 1 : 0,
+                    RC::ensure_str(m_pipeline_job.atlas_coverage.failure.c_str()),
+                    m_pipeline_job.atlas_coverage.valid_coverage_ratio,
+                    m_pipeline_job.atlas_coverage.direct_coverage_ratio,
+                    m_pipeline_job.atlas_coverage.inferred_coverage_ratio,
+                    m_pipeline_job.atlas_coverage.min_chart_coverage,
+                    m_pipeline_job.atlas_coverage.lower_body_undercovered ? 1 : 0,
+                    m_pipeline_job.atlas_coverage.side_undercovered ? 1 : 0,
+                    m_pipeline_job.atlas_coverage.back_undercovered ? 1 : 0,
+                    apply_backend_label(m_pipeline_job.apply_backend.backend),
+                    m_pipeline_job.apply_backend.ok ? 1 : 0,
+                    m_pipeline_job.timing.background_trace_ms,
+                    m_pipeline_job.camera_state_restored ? 1 : 0);
+                RC::Output::send<RC::LogLevel::Warning>(
+                    STR("{} play v2_runtime_atlas refused reason={} failure={} no_import=1 fallback_used=0 legacy_splat_success=0 apply_backend={} atlas_source={} atlas_probe_ok=1 uv_chart_count={} uv_overlap_ratio={} per_chart_coverage={} exact_material_source=unavailable material_confidence=unknown material_source=unavailable phase_ms=({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}) frame_budget_overrun=0 readback_backend_cached=0 camera_state_restored={} job_stage=surface_trace_sampling\n"),
+                    ModTag,
+                    m_pipeline_job.reason.empty() ? STR("<none>") : m_pipeline_job.reason,
+                    m_state.last_failure,
+                    apply_backend_label(m_pipeline_job.apply_backend.backend),
+                    RC::ensure_str(m_pipeline_job.atlas_probe.source.c_str()),
+                    m_pipeline_job.atlas_probe.chart_count,
+                    m_pipeline_job.atlas_probe.overlap_ratio,
+                    m_pipeline_job.atlas_coverage.min_chart_coverage,
+                    m_pipeline_job.timing.resolve_ms,
+                    m_pipeline_job.timing.coarse_hit_ms,
+                    m_pipeline_job.timing.refined_hit_ms,
+                    m_pipeline_job.timing.background_trace_ms,
+                    m_pipeline_job.timing.capture_scene_ms,
+                    m_pipeline_job.timing.bulk_readback_ms,
+                    m_pipeline_job.timing.calibration_ms,
+                    m_pipeline_job.timing.side_query_ms,
+                    m_pipeline_job.timing.assembly_ms,
+                    m_pipeline_job.timing.import_ms,
+                    m_pipeline_job.timing.verify_ms,
+                    m_pipeline_job.camera_state_restored ? 1 : 0);
+                finish_pipeline_job();
+                return;
+            }
+
+            if (m_pipeline_job.stage == UiPipelineStage::Apply)
+            {
+                const auto apply_tick_start = SteadyClock::now();
+                MecchaCamouflage::Core::FrameBudget budget{4.0, 8.0};
+                int attempted_this_tick = 0;
+                int sent_this_tick = 0;
+                int local_this_tick = 0;
+                int failed_this_tick = 0;
+                StringType first_failure{};
+                while (m_pipeline_job.apply_cursor < static_cast<int>(m_pipeline_job.apply_samples.size()) &&
+                       attempted_this_tick < m_pipeline_job.stroke_plan.strokes_per_tick)
+                {
+                    const auto stroke_start = SteadyClock::now();
+                    const auto& sample = m_pipeline_job.apply_samples[static_cast<size_t>(m_pipeline_job.apply_cursor)];
+
+                    const auto call_result =
+                        call_replicated_paint_at_uv(m_pipeline_job.component,
+                                                    sample,
+                                                    0,
+                                                    false,
+                                                    m_pipeline_job.brush);
+                    ++attempted_this_tick;
+                    ++m_pipeline_job.apply_cursor;
+                    if (call_result.server_called)
+                    {
+                        ++sent_this_tick;
+                        ++m_pipeline_job.replicated_strokes_sent;
+                        if (m_pipeline_job.apply_rpc == STR("<none>"))
+                        {
+                            m_pipeline_job.apply_rpc = call_result.server_rpc;
+                        }
+                    }
+                    else
+                    {
+                        ++failed_this_tick;
+                        ++m_pipeline_job.replicated_strokes_failed;
+                        if (first_failure.empty())
+                        {
+                            first_failure = call_result.failure.empty() ? STR("replicated_paint_call_failed") : call_result.failure;
+                        }
+                    }
+                    if (call_result.local_echo_called)
+                    {
+                        ++local_this_tick;
+                        ++m_pipeline_job.local_echo_strokes;
+                        if (m_pipeline_job.local_echo_rpc == STR("<none>"))
+                        {
+                            m_pipeline_job.local_echo_rpc = call_result.local_rpc;
+                        }
+                    }
+
+                    if (budget.consume(elapsed_ms_since(stroke_start)))
+                    {
+                        break;
+                    }
+                }
+                if (budget.overrun)
+                {
+                    ++m_pipeline_job.apply_frame_overruns;
+                }
+                m_pipeline_job.frame_budget_overrun = m_pipeline_job.frame_budget_overrun || budget.overrun;
+                m_pipeline_job.timing.import_ms += elapsed_ms_since(apply_tick_start);
+                RC::Output::send<RC::LogLevel::Warning>(
+                    STR("{} replicated_apply_tick cursor={}/{} attempted={} replicated_strokes_sent={} local_echo_strokes={} failed={} apply_rpc={} local_echo_rpc={} max_replicated_strokes_per_tick={} frame_budget_overrun={} hard_budget_overrun={} budget_ms={} job_stage=apply texture_import_used=0 import_backend=0 replicated_apply=1 replicated_partial={} quality_success={} color_source=hidden_character_capture brush_payload=1 apply_mode=AlphaBlend brush_radius={} effective_brush_world_radius={} brush_seed_radius_px={} brush_subdivision_level={} brush_subdivision_pixel_size={} no_trace_color_fallback=1 first_failure={}\n"),
+                    ModTag,
+                    m_pipeline_job.apply_cursor,
+                    m_pipeline_job.apply_samples.size(),
+                    attempted_this_tick,
+                    sent_this_tick,
+                    local_this_tick,
+                    failed_this_tick,
+                    m_pipeline_job.apply_rpc,
+                    m_pipeline_job.local_echo_rpc,
+                    m_pipeline_job.stroke_plan.strokes_per_tick,
+                    budget.overrun ? 1 : 0,
+                    budget.hard_overrun ? 1 : 0,
+                    budget.consumed_ms,
+                    m_pipeline_job.stroke_plan.partial ? 1 : 0,
+                    m_pipeline_job.stroke_plan.quality_success ? 1 : 0,
+                    m_pipeline_job.brush.radius,
+                    m_pipeline_job.brush.effective_world_radius,
+                    m_pipeline_job.brush.seed_radius_px,
+                    m_pipeline_job.brush.subdivision_level,
+                    m_pipeline_job.brush.subdivision_pixel_size,
+                    first_failure.empty() ? STR("<none>") : first_failure);
+                if (m_pipeline_job.apply_cursor < static_cast<int>(m_pipeline_job.apply_samples.size()))
+                {
+                    return;
+                }
+
+                m_state.paint_uv_success = m_pipeline_job.replicated_strokes_sent;
+                m_state.queued_strokes = static_cast<int>(m_pipeline_job.apply_samples.size());
+                m_state.verified_visible_backend = m_pipeline_job.local_echo_strokes > 0;
+                m_state.verified_paint_function = m_pipeline_job.apply_rpc;
+                if (m_pipeline_job.replicated_strokes_sent <= 0)
+                {
+                    m_state.failures = 1;
+                    m_state.success = 0;
+                    m_state.last_failure = first_failure.empty() ? STR("replicated_paint_no_strokes_sent") : first_failure;
+                }
+                else
+                {
+                    m_state.failures = 0;
+                    m_state.success = 1;
+                    m_state.last_failure = m_pipeline_job.stroke_plan.partial ? STR("dev_replicated_partial_apply") : STR("<none>");
+                }
+                RC::Output::send<RC::LogLevel::Warning>(
+                    STR("{} play replicated_paint result reason={} success={} visible_backend={} queued_strokes={} replicated_apply=1 replicated_strokes_sent={} local_echo_strokes={} replicated_strokes_failed={} apply_rpc={} local_echo_rpc={} import_backend=0 texture_import_used=0 no_apply=0 albedo_only=1 material_channels_sent=0 replicated_partial={} quality_success={} atlas_source={} atlas_probe_ok={} exact_material_source=unavailable material_confidence=preserved_original material_source=hidden_character_capture_rgb_estimated color_source=hidden_character_capture brush_payload=1 apply_mode=AlphaBlend brush_radius={} effective_brush_world_radius={} brush_seed_radius_px={} brush_subdivision_level={} brush_subdivision_pixel_size={} frame_budget_overrun={} apply_frame_overruns={} phase_ms=({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}) fallback_used=0 legacy_splat_success=0 job_stage=complete\n"),
+                    ModTag,
+                    m_pipeline_job.reason.empty() ? STR("<none>") : m_pipeline_job.reason,
+                    m_state.success,
+                    m_state.verified_visible_backend ? 1 : 0,
+                    m_state.queued_strokes,
+                    m_pipeline_job.replicated_strokes_sent,
+                    m_pipeline_job.local_echo_strokes,
+                    m_pipeline_job.replicated_strokes_failed,
+                    m_pipeline_job.apply_rpc,
+                    m_pipeline_job.local_echo_rpc,
+                    m_pipeline_job.stroke_plan.partial ? 1 : 0,
+                    m_pipeline_job.stroke_plan.quality_success ? 1 : 0,
+                    RC::ensure_str(m_pipeline_job.atlas_probe.source.c_str()),
+                    m_pipeline_job.atlas_probe.ok ? 1 : 0,
+                    m_pipeline_job.brush.radius,
+                    m_pipeline_job.brush.effective_world_radius,
+                    m_pipeline_job.brush.seed_radius_px,
+                    m_pipeline_job.brush.subdivision_level,
+                    m_pipeline_job.brush.subdivision_pixel_size,
+                    m_pipeline_job.frame_budget_overrun ? 1 : 0,
+                    m_pipeline_job.apply_frame_overruns,
+                    m_pipeline_job.timing.resolve_ms,
+                    m_pipeline_job.timing.coarse_hit_ms,
+                    m_pipeline_job.timing.refined_hit_ms,
+                    m_pipeline_job.timing.background_trace_ms,
+                    m_pipeline_job.timing.capture_scene_ms,
+                    m_pipeline_job.timing.bulk_readback_ms,
+                    m_pipeline_job.timing.calibration_ms,
+                    m_pipeline_job.timing.side_query_ms,
+                    m_pipeline_job.timing.assembly_ms,
+                    m_pipeline_job.timing.import_ms,
+                    m_pipeline_job.timing.verify_ms);
+                finish_pipeline_job();
+                return;
+            }
+        }
+
+        auto execute_pipeline_once() -> void
         {
             m_state.queue_active = false;
             m_state.cancelled = false;
@@ -7985,11 +11372,12 @@ namespace
             m_state.paint_uv_success = 0;
             m_state.paint_world_success = 0;
             m_state.commit_calls = 0;
+            m_state.side_budget_exhausted = 0;
             m_state.verified_paint_function = STR("PaintAtScreenPosition.body_mask");
             m_state.verified_paint_channel = PaintChannelAlbedoMetallicRoughness;
 
             RC::Output::send<RC::LogLevel::Warning>(
-                STR("{} play started id={} version={} route=f10_front_paint backend=validated_bulk_only actual_model_paint=1 viewport_resolution_capture=1 scene_capture_color=1 trace_primary=1 capture_alignment=disabled alignment_used=0 front_screen_paint=1 import_fallback=0 fallback_used=0 side_enabled=0 no_gui=1 no_umg_overlay=1 no_material_shader=1 no_clear=1 no_commit=1 no_mesh_hide=1 no_trace_color_fallback=1\n"),
+                STR("{} play started id={} version={} route=f10_front_paint backend=validated_bulk_only actual_model_paint=1 viewport_resolution_capture=1 scene_capture_color=1 trace_primary=1 capture_alignment=disabled alignment_used=0 front_screen_paint=1 import_fallback=0 fallback_used=0 side_enabled=0 no_gui=1 no_umg_overlay=1 no_material_shader=1 no_clear=1 no_commit=1 no_mesh_hide=1 no_trace_color_fallback=1 job_stage=started frame_budget_soft_ms=4 frame_budget_hard_ms=8\n"),
                 ModTag,
                 m_state.play_id,
                 ModVersion);
