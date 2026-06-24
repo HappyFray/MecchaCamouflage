@@ -9938,7 +9938,7 @@ namespace
         SdkAtlasSideBackResult side_back{};
         std::vector<FrontSample> atlas_samples = captured_front.samples;
         const bool mirror_side_back_for_texture = false;
-        const bool collect_side_back_for_texture = texture_sync_probe;
+        const bool collect_side_back_for_texture = false;
         const bool collect_static_hybrid_side = static_hybrid_probe;
         if (mirror_side_back_for_texture)
         {
