@@ -1,36 +1,10 @@
-# Build output
+# Build artifacts
 /.build/
-/build/
-/build-dev/
-/out/
 /packages/
 *.obj
-
-# External dependencies
-/external/
-/third_party/
-
-# Bytecode / generated local caches
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyc
-*.pyc.*
-*.pyd
-*$py.class
-
-# UE4SS / game runtime artifacts
-/Chameleon/
-/Mods/
-/Binaries/
-/Content/
-*.pak
-*.ucas
-*.utoc
-*.sig
-*.exe
-*.dll
 *.pdb
+*.dll
+*.exe
 *.lib
 *.exp
 *.ilk
@@ -39,8 +13,20 @@ __pycache__/
 *.trace
 *.tmp
 
-# Tool-local build output
-/tools/Dumper-7/build/
+# Runtime/game artifacts
+/Chameleon/
+/Mods/
+/Binaries/
+/Content/
+*.pak
+*.ucas
+*.utoc
+*.sig
+
+# Dumper-7 tool build output
+/dumper-sdk/tool/build/
+/dumper-sdk/tool/out/
+/dumper-sdk/tool/.vs/
 
 # IDE / OS noise
 /.vs/
@@ -62,7 +48,7 @@ build.ninja
 .ninja_deps
 .ninja_log
 
-# Local scripts and machine-specific config
+# Local config
 *.local.ps1
 *.local.ini
 /.env

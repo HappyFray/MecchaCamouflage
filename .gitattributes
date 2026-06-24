@@ -2,8 +2,22 @@
 *.cpp text eol=lf
 *.h text eol=lf
 *.hpp text eol=lf
+*.c text eol=lf
 *.cmake text eol=lf
 CMakeLists.txt text eol=lf
 *.ps1 text eol=crlf
+*.sh text eol=lf
 *.md text eol=lf
 *.ini text eol=crlf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.exe binary
+*.dll binary
+*.pdb binary
+*.obj binary
+*.lib binary
+*.exp binary
+*.zip binary
+dumper-sdk/5.6.1-44394996+++UE5+Release-5.6-Chameleon/** linguist-generated=true
+dumper-sdk/tool/** linguist-vendored=true

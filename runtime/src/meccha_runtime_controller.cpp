@@ -49,6 +49,8 @@ namespace
         double service_max_duration_seconds{0.0};
         std::wstring service_stop_file{};
         std::string native_apply_mode{"texture_sync_strict_probe"};
+        bool auto_sdk_probe{false};
+        bool auto_sdk_deep_probe{false};
         bool print_summary{false};
     };
 
@@ -707,11 +709,12 @@ namespace
     auto mode_to_route(const std::string& native_apply_mode) -> std::string
     {
         if (native_apply_mode == "texture_sync_strict_probe") return "f10_texture_sync_strict_probe";
-        if (native_apply_mode == "front_atlas_paint_stream") return "f10_front_atlas_paint_stream";
-        if (native_apply_mode == "front_sample_paint_stream") return "f10_front_sample_paint_stream";
-        if (native_apply_mode == "texture_atlas_paint_api_stream") return "f10_texture_atlas_paint_api_stream";
-        if (native_apply_mode == "front_metallic_texture_paint_stream") return "f10_front_metallic_texture_paint_stream";
-        return native_apply_mode;
+        return "unsupported_route";
+    }
+
+    auto is_supported_native_apply_mode(const std::string& native_apply_mode) -> bool
+    {
+        return native_apply_mode == "texture_sync_strict_probe";
     }
 
     auto paint_payload(const Config& config, const ProcessInfo& process) -> std::string
@@ -800,6 +803,14 @@ namespace
     {
         const std::string run_id = hex64(GetTickCount64()) + hex64(process.pid);
         const double start = seconds_now();
+        if (!is_supported_native_apply_mode(config.native_apply_mode))
+        {
+            const std::string details = std::string("{\"native_apply_mode\":") + json_string(config.native_apply_mode) +
+                                        ",\"supported_native_apply_mode\":\"texture_sync_strict_probe\"}";
+            diagnostics.record_error("unsupported_route", "unsupported native apply mode", details, run_id);
+            diagnostics.event("paint_failed", "error", "unsupported_route", "unsupported native apply mode", details, run_id);
+            return false;
+        }
         diagnostics.event("plan_generated", "info", "plan", "native paint payload generated",
                           std::string("{\"native_apply_mode\":") + json_string(config.native_apply_mode) + "}", run_id);
         diagnostics.set_last_run(std::string("{\"run_id\":") + json_string(run_id) +
@@ -885,6 +896,8 @@ namespace
             else if (key == L"--service-max-duration-seconds") config.service_max_duration_seconds = std::max(0.0, _wtof(next_w().c_str()));
             else if (key == L"--service-stop-file") config.service_stop_file = next_w();
             else if (key == L"--native-apply-mode") config.native_apply_mode = next_s();
+            else if (key == L"--auto-sdk-probe") config.auto_sdk_probe = true;
+            else if (key == L"--auto-sdk-deep-probe") { config.auto_sdk_probe = true; config.auto_sdk_deep_probe = true; }
             else if (key == L"--print-summary") config.print_summary = true;
             else if (key == L"--adapter" || key == L"--service-trigger-key" || key == L"--service-stop-key" || key == L"--service-trigger-file" || key == L"--native-root" || key == L"--bridge-path" || key == L"--bridge-transport") { if (has_value()) ++i; }
             else if (key == L"--service-apply-on-start" || key == L"--service-apply-every-frame" || key == L"--quick" || key == L"--dry-run") {}
@@ -924,7 +937,10 @@ namespace
         DWORD injected_pid = 0;
         if (!ensure_bridge(config, bridge_path, process, diagnostics, injected_pid))
             return 2;
-        if (!run_probe_sequence(config, bridge_path, diagnostics, true) && paint)
+        if (!paint)
+            return run_probe_sequence(config, bridge_path, diagnostics, true) ? 0 : 3;
+        if ((config.auto_sdk_probe || config.auto_sdk_deep_probe) &&
+            !run_probe_sequence(config, bridge_path, diagnostics, config.auto_sdk_deep_probe))
             return 3;
         if (paint)
             return run_paint(config, bridge_path, process, diagnostics) ? 0 : 4;
@@ -996,7 +1012,7 @@ namespace
                 ensure_bridge(config, bridge_path, process, diagnostics, injected_pid);
                 last_bridge_check = now;
             }
-            if (injected_pid == process.pid && sdk_probe_pid != process.pid && now - last_sdk_probe >= 10.0)
+            if (config.auto_sdk_probe && injected_pid == process.pid && sdk_probe_pid != process.pid && now - last_sdk_probe >= 10.0)
             {
                 last_sdk_probe = now;
                 auto probe = run_bridge_command(config, bridge_path, "sdk_probe");
@@ -1004,7 +1020,7 @@ namespace
                 if (probe.success)
                     sdk_probe_pid = process.pid;
             }
-            if (sdk_probe_pid == process.pid && sdk_deep_probe_pid != process.pid && now - last_sdk_deep_probe >= 10.0)
+            if (config.auto_sdk_deep_probe && sdk_probe_pid == process.pid && sdk_deep_probe_pid != process.pid && now - last_sdk_deep_probe >= 10.0)
             {
                 last_sdk_deep_probe = now;
                 auto deep = run_bridge_command(config, bridge_path, "sdk_deep_probe");
@@ -1015,9 +1031,11 @@ namespace
             if (hotkey.consume())
             {
                 diagnostics.event("f10_triggered", "info", "hotkey", "F10 trigger detected");
-                if (sdk_probe_pid != process.pid || sdk_deep_probe_pid != process.pid)
+                const bool probe_required = config.auto_sdk_probe && sdk_probe_pid != process.pid;
+                const bool deep_probe_required = config.auto_sdk_deep_probe && sdk_deep_probe_pid != process.pid;
+                if (probe_required || deep_probe_required)
                 {
-                    diagnostics.event("paint_ignored_sdk_not_ready", "warning", "sdk_context_pending", "paint trigger ignored until sdk_probe and sdk_deep_probe complete",
+                    diagnostics.event("paint_ignored_sdk_not_ready", "warning", "sdk_context_pending", "paint trigger ignored until SDK probes complete",
                                       std::string("{\"pid\":") + std::to_string(process.pid) +
                                       ",\"sdk_probe_ready\":" + (sdk_probe_pid == process.pid ? "true" : "false") +
                                       ",\"sdk_deep_probe_ready\":" + (sdk_deep_probe_pid == process.pid ? "true" : "false") + "}");

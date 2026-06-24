@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.1.0",
+    [string]$Version = "1.0.0",
     [string]$OutDir = "",
     [string]$ExePath = "",
     [string]$RuntimeRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path,
@@ -8,16 +8,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-if (-not $OutDir) {
-    $OutDir = Join-Path $RuntimeRoot ".build\package"
-}
+if (-not $OutDir) { $OutDir = Join-Path $RuntimeRoot ".build\package" }
 $ArtifactName = "meccha-camouflage-$Version"
-if (-not $ExePath) {
-    $ExePath = Join-Path $RuntimeRoot ".build\native\bin\meccha-camouflage.exe"
-}
-if (-not (Test-Path $ExePath -PathType Leaf)) {
-    throw "Executable not found: $ExePath. Run scripts/build_native.ps1 first."
-}
+if (-not $ExePath) { $ExePath = Join-Path $RuntimeRoot ".build\bin\meccha-camouflage.exe" }
+if (-not (Test-Path $ExePath -PathType Leaf)) { throw "Executable not found: $ExePath. Run scripts/build_native.ps1 first." }
 
 $TmpRoot = Join-Path $OutDir "tmp-release"
 Remove-Item -Recurse -Force $TmpRoot -ErrorAction SilentlyContinue
@@ -37,29 +31,21 @@ Set-Content -Encoding ASCII -Path (Join-Path $TmpRoot "runtime-config.json") -Va
 '@.Replace("%VERSION%", $Version)
 
 if ($IncludeRuntimeSource) {
-    Copy-Item -Recurse -Force (Join-Path $RuntimeRoot "native") (Join-Path $TmpRoot "native")
+    Copy-Item -Recurse -Force (Join-Path $RuntimeRoot "runtime") (Join-Path $TmpRoot "runtime")
     Copy-Item -Recurse -Force (Join-Path $RuntimeRoot "scripts") (Join-Path $TmpRoot "scripts")
-    Copy-Item -Recurse -Force (Join-Path $RuntimeRoot "docs") (Join-Path $TmpRoot "docs")
 }
 
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $ZipPath = Join-Path $OutDir "$ArtifactName.zip"
-if (Test-Path $ZipPath) {
-    Remove-Item -Force $ZipPath
-}
+if (Test-Path $ZipPath) { Remove-Item -Force $ZipPath }
 $Zip = [System.IO.Compression.ZipFile]::Open($ZipPath, [System.IO.Compression.ZipArchiveMode]::Create)
 try {
     $Root = (Resolve-Path $TmpRoot).Path.TrimEnd("\", "/") + [System.IO.Path]::DirectorySeparatorChar
     Get-ChildItem $TmpRoot -Recurse -File | ForEach-Object {
         $FullPath = (Resolve-Path $_.FullName).Path
         $RelativePath = $FullPath.Substring($Root.Length).Replace("\", "/")
-        [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
-            $Zip,
-            $_.FullName,
-            $RelativePath,
-            [System.IO.Compression.CompressionLevel]::Optimal
-        ) | Out-Null
+        [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($Zip, $_.FullName, $RelativePath, [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
     }
 } finally {
     $Zip.Dispose()

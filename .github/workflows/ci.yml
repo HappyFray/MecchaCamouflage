@@ -8,7 +8,7 @@ on:
   pull_request:
 
 jobs:
-  native-build:
+  build:
     runs-on: windows-2022
 
     steps:
@@ -20,22 +20,21 @@ jobs:
         with:
           arch: x64
 
-      - name: Build native runtime
+      - name: Build runtime
         shell: pwsh
-        run: |
-          .\scripts\build_native.ps1
+        run: .\scripts\build_native.ps1
 
-      - name: Static runtime checks
+      - name: Static checks
         shell: pwsh
         run: |
-          if (-not (Test-Path ".build/native/bin/meccha-camouflage.exe")) { throw "runtime exe missing" }
-          if (-not (Test-Path ".build/native/bin/meccha-xenos-bridge.dll")) { throw "bridge dll missing" }
-          foreach ($path in @("src", "pyproject.toml", "requirements.txt", "scripts/build_exe.ps1")) {
-            if (Test-Path $path) { throw "removed runtime path still exists: $path" }
+          if (-not (Test-Path ".build/bin/meccha-camouflage.exe")) { throw "runtime exe missing" }
+          if (-not (Test-Path ".build/bin/meccha-xenos-bridge.dll")) { throw "bridge dll missing" }
+          foreach ($path in @("native", "src", "pyproject.toml", "requirements.txt", "scripts/build_exe.ps1")) {
+            if (Test-Path $path) { throw "removed path still exists: $path" }
           }
 
       - name: Package dry run
         shell: pwsh
         run: |
-          .\scripts\package_release.ps1 -Version 0.1.0-ci
-          if (-not (Test-Path ".build/package/meccha-camouflage-0.1.0-ci.zip")) { throw "package zip missing" }
+          .\scripts\package_release.ps1 -Version 1.0.0-ci
+          if (-not (Test-Path ".build/package/meccha-camouflage-1.0.0-ci.zip")) { throw "package zip missing" }

@@ -8788,28 +8788,26 @@ namespace
         const bool front_texture_import = texture_sync_probe;
         const bool strict_38923_front_texture_import = texture_sync_probe;
         const bool diagnostic_import = texture_sync_probe;
-        const bool full_atlas_stream = request.find("\"native_apply_mode\":\"texture_atlas_paint_api_stream\"") != std::string::npos ||
-                                       request.find("\"route\":\"f10_texture_atlas_paint_api_stream\"") != std::string::npos;
-        const bool front_atlas_paint_stream = request.find("\"native_apply_mode\":\"front_atlas_paint_stream\"") != std::string::npos ||
-                                              request.find("\"route\":\"f10_front_atlas_paint_stream\"") != std::string::npos;
-        const bool front_sample_paint_stream = request.find("\"native_apply_mode\":\"front_sample_paint_stream\"") != std::string::npos ||
-                                               request.find("\"route\":\"f10_front_sample_paint_stream\"") != std::string::npos;
-        const bool front_metallic_texture_stream = request.find("\"native_apply_mode\":\"front_metallic_texture_paint_stream\"") != std::string::npos ||
-                                                   request.find("\"route\":\"f10_front_metallic_texture_paint_stream\"") != std::string::npos;
-        const bool cpu_mesh_raycast_route = request.find("\"native_apply_mode\":\"cpu_mesh_raycast\"") != std::string::npos ||
-                                            request.find("\"route\":\"f10_cpu_mesh_raycast\"") != std::string::npos;
-        const bool cpu_mesh_probe_only = request.find("\"native_apply_mode\":\"cpu_mesh_probe_only\"") != std::string::npos ||
-                                         request.find("\"route\":\"f10_cpu_mesh_probe_only\"") != std::string::npos;
-        const bool cpu_mesh_texture_import = false;
-        const bool cpu_mesh_texture_stream = request.find("\"native_apply_mode\":\"cpu_mesh_texture_paint_stream\"") != std::string::npos ||
-                                             request.find("\"route\":\"f10_cpu_mesh_texture_paint_stream\"") != std::string::npos;
-        const bool cpu_mesh_route = cpu_mesh_raycast_route || cpu_mesh_probe_only || cpu_mesh_texture_import || cpu_mesh_texture_stream;
-        const bool front_metallic_texture_route = front_metallic_texture_stream;
-        const bool front_paint_route = front_atlas_paint_stream || front_sample_paint_stream || front_metallic_texture_route;
-        const std::string route_name = texture_sync_probe ? "texture_sync_strict_probe" :
-                                       (full_atlas_stream ? "sdk_texture_atlas_paint_api_stream" :
-                                        (front_atlas_paint_stream ? "front_atlas_paint_stream" :
-                                         (front_sample_paint_stream ? "front_sample_paint_stream" : "front_metallic_texture_paint_stream")));
+        const bool disabled_full_stream = false;
+        const bool disabled_paint_stream = false;
+        const bool disabled_sample_stream = false;
+        const bool disabled_metallic_stream = false;
+        const bool disabled_mesh_probe_only = false;
+        const bool disabled_mesh_texture_stream = false;
+        const bool disabled_mesh_route = false;
+        const bool front_metallic_texture_route = disabled_metallic_stream;
+        const bool front_paint_route = false;
+        const std::string route_name = texture_sync_probe ? "texture_sync_strict_probe" : "unsupported_route";
+        if (!is_probe && !is_deep_probe && !texture_sync_probe)
+        {
+            return response_json(false,
+                                 "unsupported_route",
+                                 0,
+                                 1,
+                                 "unsupported native apply mode; only texture_sync_strict_probe is available",
+                                 std::string("\"route\":\"") + json_escape(route_name) + "\"" +
+                                     ",\"supported_native_apply_mode\":\"texture_sync_strict_probe\"");
+        }
         static volatile LONG paint_busy = 0;
         static volatile LONG dump_busy = 0;
         struct BusyGuard
@@ -9015,8 +9013,8 @@ namespace
             deep += ",\"mesh_index_buffer_available\":false";
             deep += ",\"mesh_uv_buffer_available\":false";
             deep += ",\"skinned_position_source_available\":false";
-            deep += std::string(",\"cpu_mesh_raycast_candidate\":") + json_bool(mesh_component_available && mesh_asset_function_available);
-            deep += std::string(",\"cpu_mesh_raycast_blocker\":\"") + (mesh_asset_available ? "vertex_index_uv_decode_not_implemented" : "mesh_component_or_asset_function_unavailable") + "\"";
+            deep += std::string(",\"mesh_raycast_candidate\":") + json_bool(mesh_component_available && mesh_asset_function_available);
+            deep += std::string(",\"mesh_raycast_blocker\":\"") + (mesh_asset_available ? "vertex_index_uv_decode_not_implemented" : "mesh_component_or_asset_function_unavailable") + "\"";
             deep += ",\"bridge_events\":[\"sdk_deep_probe\"]";
             const std::string deep_payload = std::string("{\"success\":true,\"stage\":\"sdk_deep_probe\",\"metadata\":{\"bridge\":\"meccha-xenos-bridge\",") + deep + "}}\n";
             std::string mesh_snapshot = "{\"success\":false,\"stage\":\"mesh_snapshot_unavailable\",\"metadata\":{";
@@ -9055,8 +9053,8 @@ namespace
             mesh_snapshot += "\"mesh_vertex_buffer_available\":false,";
             mesh_snapshot += "\"mesh_index_buffer_available\":false,";
             mesh_snapshot += "\"mesh_uv_buffer_available\":false,";
-            mesh_snapshot += std::string("\"cpu_mesh_raycast_candidate\":") + json_bool(mesh_component_available && mesh_asset_function_available) + ",";
-            mesh_snapshot += std::string("\"cpu_mesh_raycast_blocker\":\"") + (mesh_asset_available ? "vertex_index_uv_decode_not_implemented" : "mesh_component_or_asset_function_unavailable") + "\"";
+            mesh_snapshot += std::string("\"mesh_raycast_candidate\":") + json_bool(mesh_component_available && mesh_asset_function_available) + ",";
+            mesh_snapshot += std::string("\"mesh_raycast_blocker\":\"") + (mesh_asset_available ? "vertex_index_uv_decode_not_implemented" : "mesh_component_or_asset_function_unavailable") + "\"";
             mesh_snapshot += "}}\n";
             std::string mesh_buffer_candidates = "{\"success\":true,\"stage\":\"mesh_buffer_candidates_dumped\",\"metadata\":{";
             mesh_buffer_candidates += std::string("\"mesh_component\":\"") + hex_address(mesh) + "\",";
@@ -9100,7 +9098,7 @@ namespace
             mesh_snapshot_v2 += "\"skin_weight_available\":false,";
             mesh_snapshot_v2 += "\"component_transform_available\":false,";
             mesh_snapshot_v2 += "\"bone_transform_available\":false,";
-            mesh_snapshot_v2 += "\"cpu_mesh_raycast_route_ready\":false";
+            mesh_snapshot_v2 += "\"mesh_raycast_route_ready\":false";
             mesh_snapshot_v2 += "}}\n";
             std::string cpu_validation = "{\"success\":false,\"stage\":\"mesh_snapshot_failed\",\"metadata\":{";
             cpu_validation += "\"schema_version\":1,\"cpu_validation_executed\":false,\"reason\":\"mesh_snapshot_v2_not_ready\",";
@@ -9143,9 +9141,9 @@ namespace
                     ",\"route\":\"" + (texture_sync_probe ? std::string("texture_sync_strict_probe") : route_name) + "\"" +
                     ",\"replication\":\"component_server_paint_batch\"" +
                     ",\"replicated_paint_used\":" + json_bool(!front_texture_import) +
-                    ",\"front_paint_stream_used\":" + json_bool(front_atlas_paint_stream || front_sample_paint_stream || front_metallic_texture_stream) +
-                    ",\"front_atlas_paint_stream_used\":" + json_bool(front_atlas_paint_stream) +
-                    ",\"front_sample_paint_stream_used\":" + json_bool(front_sample_paint_stream) +
+                    ",\"front_paint_stream_used\":" + json_bool(disabled_paint_stream || disabled_sample_stream || disabled_metallic_stream) +
+                    ",\"disabled_paint_stream_used\":" + json_bool(disabled_paint_stream) +
+                    ",\"disabled_sample_stream_used\":" + json_bool(disabled_sample_stream) +
                     ",\"front_texture_import_used\":" + json_bool(texture_sync_probe) +
                     ",\"front_texture_source_expected\":\"" + std::string(strict_38923_front_texture_import ? "bulk_calibrated_direct_texture" :
                                                                            (front_texture_import ? "sampled_pixel_front_atlas_legacy_explicit_only" : "not_applicable")) + "\"" +
@@ -9171,12 +9169,12 @@ namespace
                     ",\"metallic_base_skip_reason\":\"" + std::string(front_texture_import ? "skipped_for_38923_texture_parity" : "not_applicable") + "\"" +
                     ",\"target_channel\":\"Albedo\"";
 
-        if (!is_probe && !is_deep_probe && cpu_mesh_route && !g_mesh_snapshot_ready.load())
+        if (!is_probe && !is_deep_probe && disabled_mesh_route && !g_mesh_snapshot_ready.load())
         {
             const char* cpu_stage = meccha_mesh_layout::ExactRenderDataLayoutAvailable ? "mesh_snapshot_failed" : meccha_mesh_layout::FailureStage;
             emit_progress(cpu_stage, "CPU mesh snapshot is unavailable; exact render data layout is not ready", 1, 8, elapsed_now_ms());
             metadata += ",\"mesh_snapshot_ready\":false" +
-                        std::string(",\"cpu_mesh_raycast_route_ready\":false") +
+                        std::string(",\"mesh_raycast_route_ready\":false") +
                         std::string(",\"generated_cppsdk_available\":") + json_bool(meccha_mesh_layout::GeneratedCppSdkAvailable) +
                         std::string(",\"generated_cppsdk_path\":\"") + json_escape(meccha_mesh_layout::GeneratedCppSdkPath) + "\"" +
                         std::string(",\"generated_sdk_version\":\"") + json_escape(meccha_mesh_layout::GeneratedSdkVersion) + "\"" +
@@ -9187,8 +9185,8 @@ namespace
                         std::string(",\"exact_layout_version\":\"") + meccha_mesh_layout::LayoutVersion + "\"" +
                         std::string(",\"exact_layout_available\":") + json_bool(meccha_mesh_layout::ExactRenderDataLayoutAvailable) +
                         std::string(",\"layout_failure_reason\":\"") + meccha_mesh_layout::FailureReason + "\"" +
-                        std::string(",\"cpu_mesh_probe_only\":") + json_bool(cpu_mesh_probe_only) +
-                        std::string(",\"cpu_mesh_texture_paint_stream\":") + json_bool(cpu_mesh_texture_stream) +
+                        std::string(",\"disabled_mesh_probe_only\":") + json_bool(disabled_mesh_probe_only) +
+                        std::string(",\"mesh_texture_paint_stream\":") + json_bool(disabled_mesh_texture_stream) +
                         ",\"screen_space_brush_query_fallback_used\":false" +
                         ",\"front_sampling_ue_query_skipped\":true" +
                         ",\"runtime_artifact_dir\":\"%LOCALAPPDATA%\\\\MecchaCamouflage\\\\runtime\"" +
@@ -9404,12 +9402,12 @@ namespace
             emit_progress("metallic_base_done", "metallic base replicated+local echo completed", 2, 9, elapsed_now_ms(),
                           "\"server_sent\":" + std::to_string(metallic_stats.server_sent) +
                           ",\"local_echo_strokes\":" + std::to_string(metallic_stats.client_mirror_sent));
-            paint_api_probe_selected = "skipped_front_metallic_texture_stream";
+            paint_api_probe_selected = "skipped_disabled_metallic_stream";
             atlas_target_channel = meccha_sdk::EPaintChannel::Albedo;
             atlas_use_world_position = false;
             metadata += ",\"paint_api_probe_skipped\":true";
         }
-        if (full_atlas_stream)
+        if (disabled_full_stream)
         {
             struct PaintApiProbeAttempt
             {
@@ -9524,11 +9522,11 @@ namespace
         std::string bridge_events = front_texture_import
                                         ? "\"bridge_events\":[\"texture_import_api_ready\""
                                         : "\"bridge_events\":[\"replicated_api_ready\"";
-        if (front_metallic_texture_stream)
+        if (disabled_metallic_stream)
         {
             bridge_events += ",\"metallic_base_prepared\",\"metallic_base_apply_tick\",\"metallic_base_visible\",\"metallic_base_done\"";
         }
-        else if (full_atlas_stream)
+        else if (disabled_full_stream)
         {
             bridge_events += ",\"paint_api_probe_done\"";
         }
@@ -9621,7 +9619,7 @@ namespace
         emit_progress(capture_done_stage, "front capture/readback completed", front_paint_route ? 6 : 5, front_paint_route ? 9 : 8, elapsed_now_ms(),
                               "\"front_hits\":" + std::to_string(captured_front.samples.size()));
 
-        if (front_sample_paint_stream)
+        if (disabled_sample_stream)
         {
             constexpr int sample_stroke_cap = 120000;
             std::vector<meccha_sdk::FPaintStroke> sample_strokes{};
@@ -10362,7 +10360,7 @@ namespace
                                  metadata);
         }
 
-        const int stroke_cap = front_atlas_paint_stream ? 450000 : (front_paint_route ? 120000 : 600000);
+        const int stroke_cap = disabled_paint_stream ? 450000 : (front_paint_route ? 120000 : 600000);
         auto stroke_plan = sdk_build_atlas_strokes(ctx, atlas, atlas_target_channel, atlas_use_world_position, stroke_cap);
         metadata += sdk_atlas_stroke_metadata(stroke_plan);
         if (stroke_plan.cap_exceeded || stroke_plan.strokes.empty() || static_cast<int>(stroke_plan.strokes.size()) > stroke_plan.stroke_cap)
@@ -10411,8 +10409,8 @@ namespace
             return elapsed_now_ms() < 210000.0;
         };
 
-        const int atlas_stream_batch_override = front_atlas_paint_stream ? 256 : 0;
-        const int atlas_stream_sleep_ms = front_atlas_paint_stream ? 0 : 16;
+        const int atlas_stream_batch_override = disabled_paint_stream ? 256 : 0;
+        const int atlas_stream_sleep_ms = disabled_paint_stream ? 0 : 16;
         metadata += ",\"server_stream_batch_override\":" + std::to_string(atlas_stream_batch_override) +
                     ",\"server_stream_sleep_ms\":" + std::to_string(atlas_stream_sleep_ms);
         if (!sdk_dispatch_replicated_strokes_with_progress(ctx,
@@ -10581,8 +10579,8 @@ namespace
                    "\"message\":\"ok\",\"timing_ms\":{},"
                    "\"metadata\":{\"commands\":[\"ping\",\"capabilities\",\"sdk_probe\",\"sdk_deep_probe\",\"paint_full_route\",\"shutdown\"],"
                    "\"sdk\":\"chameleonEsp_dumper7_1_7_0_min\","
-                   "\"paint_full_route\":\"front_atlas_paint_stream\","
-                   "\"replication\":\"component_server_paint_batch\","
+                   "\"paint_full_route\":\"texture_sync_strict_probe\","
+                   "\"replication\":\"texture_sync_rpc\","
                    "\"multiplayer_replicated\":true}}\n";
         }
         if (line.find("\"type\":\"shutdown\"") != std::string::npos)

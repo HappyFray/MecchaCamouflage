@@ -12,7 +12,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 if (-not $DumperRoot) {
-    $DumperRoot = Join-Path $RuntimeRoot "tools\Dumper-7"
+    $DumperRoot = Join-Path $RuntimeRoot "dumper-sdk\tool"
 }
 if (-not $OutputRoot) {
     $OutputRoot = Join-Path $RuntimeRoot "dumper-sdk"
@@ -24,7 +24,7 @@ $OutputRoot = (Resolve-Path $OutputRoot).Path
 
 $DumperBuildDir = Join-Path $RuntimeRoot ".build\dumper7"
 $DumperDll = Join-Path $DumperBuildDir "bin\Release\Dumper-7.dll"
-$Injector = Join-Path $RuntimeRoot ".build\native\bin\meccha-xenos-injector.exe"
+$Injector = Join-Path $RuntimeRoot ".build\bin\meccha-xenos-injector.exe"
 $GlobalConfigDir = "C:\Dumper-7"
 $GlobalConfigPath = Join-Path $GlobalConfigDir "Dumper-7.ini"
 
@@ -62,7 +62,7 @@ if (-not (Test-Path $DumperDll)) {
     throw "Dumper-7 DLL not found: $DumperDll"
 }
 if (-not (Test-Path $Injector)) {
-    throw "Injector not found. Run ./scripts/dev_flow.sh -Action build first. Expected: $Injector"
+    throw "Injector not found. Run scripts/build_native.ps1 first. Expected: $Injector"
 }
 
 New-Item -ItemType Directory -Force -Path $GlobalConfigDir | Out-Null
