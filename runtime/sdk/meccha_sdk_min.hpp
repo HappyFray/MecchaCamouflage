@@ -207,6 +207,21 @@ namespace meccha_sdk
         std::uint8_t A{255};
     };
 
+    struct ColorPicker_SampleViewportGBuffer
+    {
+        void* WorldContextObject{nullptr};
+        FVector2D ScreenPosition{};
+        FLinearColor OutBaseColor{};
+        float OutMetallic{0.0f};
+        float OutRoughness{0.0f};
+        void* OptionalMetallicRoughnessMaterial{nullptr};
+        bool ReturnValue{false};
+        std::uint8_t Pad_39[0x7]{};
+    };
+    static_assert(sizeof(ColorPicker_SampleViewportGBuffer) == 0x40, "SampleViewportGBuffer params layout mismatch");
+    static_assert(offsetof(ColorPicker_SampleViewportGBuffer, OutBaseColor) == 0x18, "SampleViewportGBuffer OutBaseColor offset mismatch");
+    static_assert(offsetof(ColorPicker_SampleViewportGBuffer, ReturnValue) == 0x38, "SampleViewportGBuffer ReturnValue offset mismatch");
+
     struct FQuat
     {
         double X{0.0};
@@ -262,6 +277,21 @@ namespace meccha_sdk
         EPaintChannelApplyMode ApplyMode{EPaintChannelApplyMode::Override};
         std::uint8_t Pad_1D[0x3]{};
     };
+
+    struct RuntimePaintableComponent_PaintAtScreenPosition
+    {
+        void* MeshComponent{nullptr};
+        FVector2D ScreenPosition{};
+        void* PlayerController{nullptr};
+        FPaintChannelData ChannelData{};
+        EPaintChannel Channel{EPaintChannel::AlbedoMetallicRoughness};
+        bool bUseCachedTriangles{true};
+        std::uint8_t Pad_42[0x6]{};
+        FScreenSpacePaintResult ReturnValue{};
+    };
+    static_assert(sizeof(RuntimePaintableComponent_PaintAtScreenPosition) == 0x90, "PaintAtScreenPosition params layout mismatch");
+    static_assert(offsetof(RuntimePaintableComponent_PaintAtScreenPosition, ChannelData) == 0x20, "PaintAtScreenPosition ChannelData offset mismatch");
+    static_assert(offsetof(RuntimePaintableComponent_PaintAtScreenPosition, ReturnValue) == 0x48, "PaintAtScreenPosition ReturnValue offset mismatch");
 
     struct FPaintStroke
     {

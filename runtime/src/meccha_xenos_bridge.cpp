@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cmath>
 #include <cstdio>
@@ -27,6 +28,7 @@
 #include "../sdk/meccha_sdk_min.hpp"
 
 #pragma comment(lib, "Ws2_32.lib")
+#pragma comment(lib, "Gdi32.lib")
 
 namespace
 {
@@ -79,6 +81,9 @@ namespace
     std::atomic<bool> g_dump_cancel_requested{false};
 
     auto paint_full_route_native_direct(const std::string& request) -> std::string;
+    auto is_template_uv_brush_request(const std::string& request) -> bool;
+    auto start_template_uv_brush_async_job(const std::string& request, const std::shared_ptr<QueuedPaintJob>& queued_job) -> bool;
+    auto tick_template_uv_brush_async_job() -> void;
     auto drain_paint_jobs_on_game_thread() -> void;
     void __fastcall hooked_process_event(void* object, void* function, void* params);
     LRESULT CALLBACK message_hook_proc(int code, WPARAM wparam, LPARAM lparam);
@@ -3570,6 +3575,36 @@ namespace
         return wrote && process_event(object, function, params.data(), failure);
     }
 
+    auto sdk_call_two_bools(Reflection& ref, std::uintptr_t object, const char* function_name, bool first, bool second) -> bool
+    {
+        const auto function = ref.find_function(object, function_name);
+        if (!function)
+        {
+            return false;
+        }
+        const auto params_size = safe_read<int>(function + OffPropertiesSize, 0);
+        if (params_size <= 0 || params_size > 1024)
+        {
+            return false;
+        }
+        std::vector<std::uint8_t> params(static_cast<std::size_t>(params_size), 0);
+        bool wrote = false;
+        int bool_index = 0;
+        for (auto prop = safe_read<std::uintptr_t>(function + OffChildProperties); prop; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+        {
+            const auto name = ref.names.resolve(safe_read<std::uint32_t>(prop + OffFFieldName));
+            if (name == "ReturnValue")
+            {
+                continue;
+            }
+            const bool value = (name.find("Propagate") != std::string::npos || bool_index > 0) ? second : first;
+            wrote = write_bool(prop, params.data(), value) || wrote;
+            ++bool_index;
+        }
+        std::string failure{};
+        return wrote && process_event(object, function, params.data(), failure);
+    }
+
     auto sdk_call_object_param(Reflection& ref, std::uintptr_t object, const char* function_name, std::uintptr_t value) -> bool
     {
         const auto function = ref.find_function(object, function_name);
@@ -6752,8 +6787,8 @@ namespace
         {
             out.requested_texture_width = target_width;
             out.requested_texture_height = target_height;
-            int capture_width = std::max(1, viewport_width);
-            int capture_height = std::max(1, viewport_height);
+            int capture_width = std::max(1, target_width);
+            int capture_height = std::max(1, target_height);
             constexpr int max_capture_dimension = 4096;
             const auto max_dimension = std::max(capture_width, capture_height);
             if (max_dimension > max_capture_dimension)
@@ -6916,7 +6951,7 @@ namespace
             sdk_call_no_params(ref, out.capture_actor, "K2_DestroyActor");
             return out;
         }
-        Sleep(50);
+        Sleep(12);
 
         struct ProjectedFrontSample
         {
@@ -8883,6 +8918,1540 @@ namespace
         return samples;
     }
 
+    auto sdk_find_color_picker_caller(Reflection& ref) -> std::uintptr_t
+    {
+        if (const auto instance = ref.find_first_instance("ColorPicker"))
+        {
+            return instance;
+        }
+        const auto cls = ref.find_class("ColorPicker");
+        if (!cls)
+        {
+            return 0;
+        }
+        std::uintptr_t cdo = 0;
+        ref.for_each_object([&](std::uintptr_t obj) {
+            if (ref.class_ptr(obj) == cls && (safe_read<std::uint32_t>(obj + OffObjectFlags, 0) & RFClassDefaultObject) != 0)
+            {
+                cdo = obj;
+                return true;
+            }
+            return false;
+        });
+        return cdo ? cdo : cls;
+    }
+
+    auto sdk_template_uv_brush_auto_flush_probe(Reflection& ref, const SdkContext& ctx, std::string metadata) -> std::string
+    {
+        const auto viewport = sdk_get_viewport_info(ref, ctx);
+        const auto mesh = sdk_find_front_mesh(ref, ctx);
+        const auto color_picker = sdk_find_color_picker_caller(ref);
+        const auto sample_function = color_picker ? ref.find_function(color_picker, "SampleViewportGBuffer") : 0;
+        const auto paint_uv_function = ctx.paint_at_uv_with_brush_function ? ctx.paint_at_uv_with_brush_function : ref.find_function(ctx.component, "PaintAtUVWithBrush");
+        const auto hide_function = mesh ? ref.find_function(mesh, "SetHiddenInGame") : 0;
+        const auto begin_stroke_function = ref.find_function(ctx.component, "BeginStroke");
+        const auto end_stroke_function = ref.find_function(ctx.component, "EndStroke");
+        const auto clear_recorded_function = ref.find_function(ctx.component, "ClearRecordedStrokes");
+        const auto flush_recorded_function = ref.find_function(ctx.component, "FlushRecordedStrokesToServer");
+        const auto send_batch_function = ref.find_function(ctx.component, "SendStrokeBatchToServer");
+
+        metadata += ",\"route\":\"template_uv_brush_auto_flush_probe\"";
+        metadata += ",\"artist_template_like\":true";
+        metadata += ",\"texture_import_used\":false";
+        metadata += ",\"paint_at_screen_position_used\":false";
+        metadata += ",\"paint_at_uv_with_brush_used\":true";
+        const bool viewport_available = viewport.width > 0 && viewport.height > 0;
+        metadata += std::string(",\"viewport_available\":") + json_bool(viewport_available);
+        metadata += ",\"viewport_width\":" + std::to_string(viewport.width);
+        metadata += ",\"viewport_height\":" + std::to_string(viewport.height);
+        metadata += std::string(",\"front_mesh_available\":") + json_bool(mesh != 0);
+        metadata += std::string(",\"front_mesh\":\"") + hex_address(mesh) + "\"";
+        metadata += std::string(",\"color_picker_available\":") + json_bool(color_picker != 0);
+        metadata += std::string(",\"function_sample_viewport_gbuffer_available\":") + json_bool(sample_function != 0);
+        metadata += std::string(",\"function_sample_viewport_gbuffer_schema\":\"") + json_escape(function_param_schema(ref, sample_function)) + "\"";
+        metadata += std::string(",\"function_paint_at_uv_with_brush_available\":") + json_bool(paint_uv_function != 0);
+        metadata += std::string(",\"function_paint_at_uv_with_brush_schema\":\"") + json_escape(function_param_schema(ref, paint_uv_function)) + "\"";
+        metadata += std::string(",\"function_set_hidden_in_game_available\":") + json_bool(hide_function != 0);
+        metadata += std::string(",\"function_begin_stroke_available\":") + json_bool(begin_stroke_function != 0);
+        metadata += std::string(",\"function_end_stroke_available\":") + json_bool(end_stroke_function != 0);
+        metadata += std::string(",\"function_clear_recorded_strokes_available\":") + json_bool(clear_recorded_function != 0);
+        metadata += std::string(",\"function_flush_recorded_strokes_to_server_available\":") + json_bool(flush_recorded_function != 0);
+        metadata += std::string(",\"function_send_stroke_batch_to_server_available\":") + json_bool(send_batch_function != 0);
+
+        if (!viewport_available)
+        {
+            return response_json(false, "viewport_unavailable", 0, 1, "viewport size is unavailable", metadata);
+        }
+        if (!mesh)
+        {
+            return response_json(false, "front_mesh_unavailable", 0, 1, "front mesh component was not found", metadata);
+        }
+        if (!color_picker || !sample_function)
+        {
+            return response_json(false, "gbuffer_sample_unavailable", 0, 1, "SampleViewportGBuffer is unavailable", metadata);
+        }
+        if (!paint_uv_function)
+        {
+            return response_json(false, "paint_at_uv_with_brush_unavailable", 0, 1, "PaintAtUVWithBrush is unavailable", metadata);
+        }
+        if (!flush_recorded_function && !send_batch_function)
+        {
+            return response_json(false, "recorded_stroke_flush_unavailable", 0, 1, "recorded stroke flush functions are unavailable", metadata);
+        }
+
+        constexpr std::uintptr_t OffAutoRecordStrokes = 0x01AC;
+        constexpr std::uintptr_t OffAutoFlushStrokes = 0x01AD;
+        constexpr std::uintptr_t OffAutoFlushThreshold = 0x01B0;
+        constexpr std::uintptr_t OffCurrentBrushSettings = meccha_sdk::FieldOffsets::RuntimePaintable_CurrentBrushSettings;
+
+        const bool old_auto_record = safe_read<bool>(ctx.component + OffAutoRecordStrokes, false);
+        const bool old_auto_flush = safe_read<bool>(ctx.component + OffAutoFlushStrokes, false);
+        const int old_auto_flush_threshold = safe_read<int>(ctx.component + OffAutoFlushThreshold, 0);
+        meccha_sdk::FRuntimeBrushSettings old_brush{};
+        safe_copy(&old_brush, reinterpret_cast<const void*>(ctx.component + OffCurrentBrushSettings), sizeof(old_brush));
+
+        const bool new_auto_record = true;
+        const bool new_auto_flush_initial = false;
+        const bool new_auto_flush_stream = true;
+        const int new_auto_flush_threshold = 4096;
+        meccha_sdk::FRuntimeBrushSettings probe_brush = old_brush;
+        probe_brush.Radius = 0.012f;
+        probe_brush.Hardness = 1.0f;
+        probe_brush.Opacity = 1.0f;
+        probe_brush.Spacing = 0.15f;
+        probe_brush.Falloff = meccha_sdk::EBrushFalloff::Spherical;
+        probe_brush.BlendMode = meccha_sdk::EPaintBlendMode::Normal;
+
+        struct GBufferPaintPoint
+        {
+            double x{0.0};
+            double y{0.0};
+            double u{0.0};
+            double v{0.0};
+            meccha_sdk::FVector world_position{};
+        };
+        std::vector<GBufferPaintPoint> paint_points{};
+        paint_points.reserve(52000);
+        constexpr int target_paint_points = 50000;
+        constexpr int hard_hit_test_budget = 85000;
+        int hit_prefilter_calls = 0;
+        int hit_prefilter_success = 0;
+        int template_point_hits = 0;
+        bool collect_template_points = false;
+        double bbox_min_nx = 1.0;
+        double bbox_min_ny = 1.0;
+        double bbox_max_nx = 0.0;
+        double bbox_max_ny = 0.0;
+        auto record_prefilter_hit = [&](double nx, double ny, const SdkBrushQueryHit& hit) {
+            (void)hit;
+            ++hit_prefilter_success;
+            bbox_min_nx = std::min(bbox_min_nx, nx);
+            bbox_min_ny = std::min(bbox_min_ny, ny);
+            bbox_max_nx = std::max(bbox_max_nx, nx);
+            bbox_max_ny = std::max(bbox_max_ny, ny);
+            if (collect_template_points && static_cast<int>(paint_points.size()) < target_paint_points)
+            {
+                ++template_point_hits;
+                paint_points.push_back(GBufferPaintPoint{
+                    nx * static_cast<double>(viewport.width),
+                    ny * static_cast<double>(viewport.height),
+                    clamp01(hit.u),
+                    clamp01(hit.v),
+                    hit.world_position});
+            }
+        };
+        auto try_prefilter_hit = [&](double nx, double ny) {
+            if (hit_prefilter_calls >= hard_hit_test_budget ||
+                (collect_template_points && static_cast<int>(paint_points.size()) >= target_paint_points))
+            {
+                return;
+            }
+            nx = clamp01(nx);
+            ny = clamp01(ny);
+            ++hit_prefilter_calls;
+            const auto hit = sdk_hit_test_at_screen_position(ref,
+                                                             ctx,
+                                                             mesh,
+                                                             nx * static_cast<double>(viewport.width),
+                                                             ny * static_cast<double>(viewport.height));
+            if (hit.success && hit.has_uv)
+            {
+                record_prefilter_hit(nx, ny, hit);
+            }
+        };
+
+        constexpr int coarse_cols = 112;
+        constexpr int coarse_rows = 84;
+        for (int y = 0; y < coarse_rows && static_cast<int>(paint_points.size()) < target_paint_points; ++y)
+        {
+            const double ny = 0.06 + ((static_cast<double>(y) + 0.5) / static_cast<double>(coarse_rows)) * 0.90;
+            for (int x = 0; x < coarse_cols && static_cast<int>(paint_points.size()) < target_paint_points; ++x)
+            {
+                const double nx = 0.12 + ((static_cast<double>(x) + 0.5) / static_cast<double>(coarse_cols)) * 0.76;
+                try_prefilter_hit(nx, ny);
+            }
+        }
+        const bool have_bbox = bbox_max_nx >= bbox_min_nx && bbox_max_ny >= bbox_min_ny;
+        if (have_bbox && static_cast<int>(paint_points.size()) < target_paint_points)
+        {
+            const double span_x = std::max(0.04, bbox_max_nx - bbox_min_nx);
+            const double span_y = std::max(0.04, bbox_max_ny - bbox_min_ny);
+            const double min_nx = clamp01(bbox_min_nx - span_x * 0.22);
+            const double max_nx = clamp01(bbox_max_nx + span_x * 0.22);
+            const double min_ny = clamp01(bbox_min_ny - span_y * 0.16);
+            const double max_ny = clamp01(bbox_max_ny + span_y * 0.40);
+            collect_template_points = true;
+            constexpr int refine_cols = 220;
+            constexpr int refine_rows = 260;
+            for (int y = 0; y < refine_rows && static_cast<int>(paint_points.size()) < target_paint_points; ++y)
+            {
+                const double ty = refine_rows <= 1 ? 0.5 : static_cast<double>(y) / static_cast<double>(refine_rows - 1);
+                const double ny = min_ny + (max_ny - min_ny) * ty;
+                for (int x = 0; x < refine_cols && static_cast<int>(paint_points.size()) < target_paint_points; ++x)
+                {
+                    const double tx = refine_cols <= 1 ? 0.5 : static_cast<double>(x) / static_cast<double>(refine_cols - 1);
+                    const double nx = min_nx + (max_nx - min_nx) * tx;
+                    try_prefilter_hit(nx, ny);
+                }
+            }
+        }
+        write_bridge_progress("gbuffer_hit_prefilter_done",
+                              "prefiltered screen points with RuntimePaintable hit test",
+                              2,
+                              8,
+                              0.0,
+                              "\"hit_prefilter_calls\":" + std::to_string(hit_prefilter_calls) +
+                                  ",\"hit_prefilter_success\":" + std::to_string(hit_prefilter_success) +
+                                  ",\"template_point_hits\":" + std::to_string(template_point_hits) +
+                                  ",\"paint_points\":" + std::to_string(paint_points.size()));
+
+        const bool hidden_for_gbuffer = hide_function ? sdk_call_two_bools(ref, mesh, "SetHiddenInGame", true, true) : false;
+        if (hidden_for_gbuffer)
+        {
+            Sleep(16);
+        }
+
+        safe_copy(reinterpret_cast<void*>(ctx.component + OffAutoRecordStrokes), &new_auto_record, sizeof(new_auto_record));
+        safe_copy(reinterpret_cast<void*>(ctx.component + OffAutoFlushStrokes), &new_auto_flush_initial, sizeof(new_auto_flush_initial));
+        safe_copy(reinterpret_cast<void*>(ctx.component + OffAutoFlushThreshold), &new_auto_flush_threshold, sizeof(new_auto_flush_threshold));
+        safe_copy(reinterpret_cast<void*>(ctx.component + OffCurrentBrushSettings), &probe_brush, sizeof(probe_brush));
+
+        const bool clear_called = clear_recorded_function ? sdk_call_no_params(ref, ctx.component, "ClearRecordedStrokes") : false;
+        const bool begin_called = begin_stroke_function ? sdk_call_no_params(ref, ctx.component, "BeginStroke") : false;
+        safe_copy(reinterpret_cast<void*>(ctx.component + OffAutoFlushStrokes), &new_auto_flush_stream, sizeof(new_auto_flush_stream));
+
+        int gbuffer_calls = 0;
+        int gbuffer_success = 0;
+        int paint_calls = 0;
+        int paint_success = 0;
+        int paint_uv_success = 0;
+        int process_failures = 0;
+        double rgb_min = 1.0;
+        double rgb_max = 0.0;
+        double rgb_sum_r = 0.0;
+        double rgb_sum_g = 0.0;
+        double rgb_sum_b = 0.0;
+        double metallic_sum = 0.0;
+        double roughness_sum = 0.0;
+        std::string first_failure{};
+
+        for (std::size_t point_index = 0; point_index < paint_points.size(); ++point_index)
+        {
+            const double screen_x = paint_points[point_index].x;
+            const double screen_y = paint_points[point_index].y;
+
+            meccha_sdk::ColorPicker_SampleViewportGBuffer sample{};
+            sample.WorldContextObject = reinterpret_cast<void*>(ctx.world);
+            sample.ScreenPosition = meccha_sdk::FVector2D{screen_x, screen_y};
+            std::string sample_failure{};
+            ++gbuffer_calls;
+            if (!process_event(color_picker, sample_function, reinterpret_cast<std::uint8_t*>(&sample), sample_failure) || !sample.ReturnValue)
+            {
+                if (first_failure.empty())
+                {
+                    first_failure = sample_failure.empty() ? "SampleViewportGBuffer returned false" : sample_failure;
+                }
+                continue;
+            }
+
+            ++gbuffer_success;
+            const double r = clamp01(sample.OutBaseColor.R);
+            const double g = clamp01(sample.OutBaseColor.G);
+            const double b = clamp01(sample.OutBaseColor.B);
+            const double metallic = clamp01(sample.OutMetallic);
+            const double roughness = clamp01(sample.OutRoughness);
+            rgb_min = std::min(rgb_min, std::min(r, std::min(g, b)));
+            rgb_max = std::max(rgb_max, std::max(r, std::max(g, b)));
+            rgb_sum_r += r;
+            rgb_sum_g += g;
+            rgb_sum_b += b;
+            metallic_sum += metallic;
+            roughness_sum += roughness;
+
+            meccha_sdk::RuntimePaintableComponent_PaintAtUVWithBrush paint{};
+            paint.Uv = meccha_sdk::FVector2D{paint_points[point_index].u, paint_points[point_index].v};
+            paint.ChannelData.AlbedoColor = meccha_sdk::FLinearColor{
+                static_cast<float>(r),
+                static_cast<float>(g),
+                static_cast<float>(b),
+                1.0f};
+            paint.ChannelData.Metallic = static_cast<float>(metallic);
+            paint.ChannelData.Roughness = static_cast<float>(roughness);
+            paint.ChannelData.Height = 0.0f;
+            paint.ChannelData.ApplyMode = meccha_sdk::EPaintChannelApplyMode::Override;
+            paint.Channel = meccha_sdk::EPaintChannel::AlbedoMetallicRoughness;
+            paint.BrushSettings = probe_brush;
+
+            std::string paint_failure{};
+            ++paint_calls;
+            if (!process_event(ctx.component, paint_uv_function, reinterpret_cast<std::uint8_t*>(&paint), paint_failure))
+            {
+                ++process_failures;
+                if (first_failure.empty())
+                {
+                    first_failure = paint_failure;
+                }
+                continue;
+            }
+            ++paint_success;
+            ++paint_uv_success;
+            if ((point_index % 250) == 249 || point_index + 1 == paint_points.size())
+            {
+                const int step = 2 + static_cast<int>((static_cast<double>(point_index + 1) / static_cast<double>(std::max<std::size_t>(1, paint_points.size()))) * 5.0);
+                write_bridge_progress("template_uv_brush_streaming",
+                                      "sampling hidden-target viewport GBuffer and painting via UV brush",
+                                      std::min(6, step),
+                                      8,
+                                      0.0,
+                                      "\"gbuffer_success\":" + std::to_string(gbuffer_success) +
+                                          ",\"paint_success\":" + std::to_string(paint_success) +
+                                          ",\"paint_uv_success\":" + std::to_string(paint_uv_success));
+            }
+        }
+
+        const bool restored_after_gbuffer = hidden_for_gbuffer ? sdk_call_two_bools(ref, mesh, "SetHiddenInGame", false, true) : false;
+        const bool end_called = end_stroke_function ? sdk_call_no_params(ref, ctx.component, "EndStroke") : false;
+        const bool flush_called = flush_recorded_function ? sdk_call_no_params(ref, ctx.component, "FlushRecordedStrokesToServer") : false;
+        const bool send_batch_called = send_batch_function ? sdk_call_no_params(ref, ctx.component, "SendStrokeBatchToServer") : false;
+
+        safe_copy(reinterpret_cast<void*>(ctx.component + OffAutoRecordStrokes), &old_auto_record, sizeof(old_auto_record));
+        safe_copy(reinterpret_cast<void*>(ctx.component + OffAutoFlushStrokes), &old_auto_flush, sizeof(old_auto_flush));
+        safe_copy(reinterpret_cast<void*>(ctx.component + OffAutoFlushThreshold), &old_auto_flush_threshold, sizeof(old_auto_flush_threshold));
+        safe_copy(reinterpret_cast<void*>(ctx.component + OffCurrentBrushSettings), &old_brush, sizeof(old_brush));
+
+        const double denom = std::max(1, gbuffer_success);
+        metadata += ",\"gbuffer_targeting\":\"hit_test_prefiltered_uv_brush\"";
+        metadata += ",\"gbuffer_target_paint_points\":" + std::to_string(target_paint_points);
+        metadata += ",\"hit_prefilter_calls\":" + std::to_string(hit_prefilter_calls);
+        metadata += ",\"hit_prefilter_success\":" + std::to_string(hit_prefilter_success);
+        metadata += ",\"template_point_hits\":" + std::to_string(template_point_hits);
+        metadata += ",\"paint_points\":" + std::to_string(paint_points.size());
+        metadata += ",\"gbuffer_calls\":" + std::to_string(gbuffer_calls);
+        metadata += ",\"gbuffer_success\":" + std::to_string(gbuffer_success);
+        metadata += ",\"paint_calls\":" + std::to_string(paint_calls);
+        metadata += ",\"paint_uv_process_success\":" + std::to_string(paint_success);
+        metadata += ",\"paint_uv_success\":" + std::to_string(paint_uv_success);
+        metadata += ",\"paint_process_failures\":" + std::to_string(process_failures);
+        metadata += ",\"auto_record_enabled\":true";
+        metadata += ",\"auto_flush_enabled\":true";
+        metadata += ",\"auto_flush_threshold\":" + std::to_string(new_auto_flush_threshold);
+        metadata += std::string(",\"target_hidden_for_gbuffer\":") + json_bool(hidden_for_gbuffer);
+        metadata += std::string(",\"target_restored_after_gbuffer\":") + json_bool(!hidden_for_gbuffer || restored_after_gbuffer);
+        metadata += std::string(",\"clear_recorded_strokes_called\":") + json_bool(clear_called);
+        metadata += std::string(",\"begin_stroke_called\":") + json_bool(begin_called);
+        metadata += std::string(",\"end_stroke_called\":") + json_bool(end_called);
+        metadata += std::string(",\"flush_recorded_strokes_to_server_called\":") + json_bool(flush_called);
+        metadata += std::string(",\"send_stroke_batch_to_server_called\":") + json_bool(send_batch_called);
+        metadata += ",\"gbuffer_rgb_min\":" + std::to_string(rgb_min);
+        metadata += ",\"gbuffer_rgb_max\":" + std::to_string(rgb_max);
+        metadata += ",\"gbuffer_rgb_avg_r\":" + std::to_string(rgb_sum_r / denom);
+        metadata += ",\"gbuffer_rgb_avg_g\":" + std::to_string(rgb_sum_g / denom);
+        metadata += ",\"gbuffer_rgb_avg_b\":" + std::to_string(rgb_sum_b / denom);
+        metadata += ",\"gbuffer_metallic_avg\":" + std::to_string(metallic_sum / denom);
+        metadata += ",\"gbuffer_roughness_avg\":" + std::to_string(roughness_sum / denom);
+        metadata += std::string(",\"first_failure\":\"") + json_escape(first_failure) + "\"";
+        metadata += ",\"bridge_events\":[\"template_uv_brush_auto_flush_probe\"]";
+
+        write_bridge_progress("template_uv_brush_auto_flush_done",
+                              "template UV brush auto-flush paint probe completed",
+                              8,
+                              8,
+                              0.0,
+                              "\"gbuffer_success\":" + std::to_string(gbuffer_success) +
+                                  ",\"paint_success\":" + std::to_string(paint_success) +
+                                  ",\"paint_uv_success\":" + std::to_string(paint_uv_success));
+
+        if (gbuffer_success <= 0 || paint_success <= 0 || paint_uv_success <= 0)
+        {
+            return response_json(false,
+                                 "template_uv_brush_no_paint",
+                                 paint_uv_success,
+                                 1,
+                                 "template UV brush route did not produce paint calls",
+                                 metadata);
+        }
+        if (!flush_called && !send_batch_called)
+        {
+            return response_json(false,
+                                 "template_uv_brush_not_flushed",
+                                 paint_success,
+                                 1,
+                                 "paint calls ran but recorded strokes were not flushed",
+                                 metadata);
+        }
+        return response_json(true,
+                             "template_uv_brush_paint_done",
+                             paint_uv_success,
+                             0,
+                             "template UV brush paint dispatched with hidden-target GBuffer sampling",
+                             metadata);
+    }
+
+    struct TemplateUvBrushAsyncJob
+    {
+        enum class Phase
+        {
+            Phase0BaseGrid,
+            Phase0Dense,
+            Phase0LowerRescan,
+            Phase0UvExpand,
+            Phase0ScreenFill,
+            CaptureSource,
+            BeginPaint,
+            PaintBrush,
+            Finish
+        };
+
+        struct TemplatePoint
+        {
+            double x{0.0};
+            double y{0.0};
+            double u{0.0};
+            double v{0.0};
+            double r{0.0};
+            double g{0.0};
+            double b{0.0};
+            double metallic{0.0};
+            double roughness{0.85};
+            bool has_color{false};
+        };
+
+        std::shared_ptr<QueuedPaintJob> queued{};
+        Phase phase{Phase::Phase0BaseGrid};
+        std::uintptr_t world{0};
+        std::uintptr_t controller{0};
+        std::uintptr_t component{0};
+        std::uintptr_t mesh{0};
+        std::uintptr_t color_picker{0};
+        std::uintptr_t hit_test_function{0};
+        std::uintptr_t sample_function{0};
+        std::uintptr_t paint_uv_function{0};
+        std::uintptr_t begin_stroke_function{0};
+        std::uintptr_t end_stroke_function{0};
+        std::uintptr_t clear_recorded_function{0};
+        std::uintptr_t flush_recorded_function{0};
+        std::uintptr_t send_batch_function{0};
+        std::uintptr_t hide_function{0};
+        int viewport_width{0};
+        int viewport_height{0};
+        int base_cols{54};
+        int base_rows{86};
+        int dense_cols{132};
+        int dense_rows{220};
+        int lower_cols{96};
+        int lower_rows{78};
+        int next_index{0};
+        int capture_index{0};
+        int paint_index{0};
+        int point_target{14000};
+        int base_attempts{0};
+        int base_hits{0};
+        int dense_attempts{0};
+        int dense_hits{0};
+        int lower_attempts{0};
+        int lower_hits{0};
+        int uv_expand_index{0};
+        int uv_expand_added{0};
+        int screen_fill_index{0};
+        int screen_fill_added{0};
+        int dedupe_skipped{0};
+        int gbuffer_success{0};
+        int paint_success{0};
+        int process_failures{0};
+        int commit_pulses{0};
+        int progress_percent{-1};
+        double paint_tick_budget_ms{2.0};
+        int max_paints_per_tick{64};
+        int screen_capture_width{0};
+        int screen_capture_height{0};
+        int screen_capture_origin_x{0};
+        int screen_capture_origin_y{0};
+        double bbox_min_nx{1.0};
+        double bbox_min_ny{1.0};
+        double bbox_max_nx{0.0};
+        double bbox_max_ny{0.0};
+        bool source_sorted{false};
+        bool old_auto_record{false};
+        bool old_auto_flush{false};
+        int old_auto_flush_threshold{0};
+        int auto_flush_threshold{4096};
+        meccha_sdk::FRuntimeBrushSettings old_brush{};
+        meccha_sdk::FRuntimeBrushSettings brush{};
+        bool clear_called{false};
+        bool begin_called{false};
+        bool end_called{false};
+        bool flush_called{false};
+        bool send_batch_called{false};
+        bool hide_called{false};
+        bool restore_called{false};
+        bool screen_capture_attempted{false};
+        bool screen_capture_ready{false};
+        bool trace_parity{false};
+        double brush_radius{0.008};
+        double rgb_min{1.0};
+        double rgb_max{0.0};
+        double rgb_sum_r{0.0};
+        double rgb_sum_g{0.0};
+        double rgb_sum_b{0.0};
+        double metallic_sum{0.0};
+        double roughness_sum{0.0};
+        std::string metadata{};
+        std::string first_failure{};
+        std::string source_path{"streamed_sample_viewport_gbuffer"};
+        std::vector<TemplatePoint> points{};
+        std::vector<std::uint8_t> uv_bins{};
+        std::vector<std::uint8_t> screen_rgb{};
+        std::chrono::steady_clock::time_point started{};
+        std::chrono::steady_clock::time_point last_tick{};
+        std::chrono::steady_clock::time_point hidden_at{};
+    };
+
+    std::mutex g_template_uv_brush_mutex;
+    std::shared_ptr<TemplateUvBrushAsyncJob> g_template_uv_brush_job{};
+
+    auto is_template_uv_brush_request(const std::string& request) -> bool
+    {
+        return request.find("\"native_apply_mode\":\"artist_template_brush_paint\"") != std::string::npos ||
+               request.find("\"route\":\"f10_artist_template_brush_paint\"") != std::string::npos ||
+               request.find("\"native_apply_mode\":\"artist_trace_parity\"") != std::string::npos ||
+               request.find("\"route\":\"f10_artist_trace_parity\"") != std::string::npos;
+    }
+
+    void complete_template_uv_brush_job(const std::shared_ptr<TemplateUvBrushAsyncJob>& job, const std::string& response)
+    {
+        if (!job || !job->queued)
+        {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_paint_jobs_mutex);
+            job->queued->response = response;
+            job->queued->done = true;
+        }
+        g_paint_jobs_cv.notify_all();
+    }
+
+    auto artist_add_template_point(const std::shared_ptr<TemplateUvBrushAsyncJob>& job,
+                                   double screen_x,
+                                   double screen_y,
+                                   double u,
+                                   double v) -> bool
+    {
+        if (!job || static_cast<int>(job->points.size()) >= job->point_target)
+        {
+            return false;
+        }
+        if (!std::isfinite(screen_x) || !std::isfinite(screen_y) || !std::isfinite(u) || !std::isfinite(v))
+        {
+            return false;
+        }
+        u = clamp01(u);
+        v = clamp01(v);
+        constexpr int Quant = 768;
+        if (job->uv_bins.empty())
+        {
+            job->uv_bins.assign(Quant * Quant, 0);
+        }
+        const int qu = std::max(0, std::min(Quant - 1, static_cast<int>(u * static_cast<double>(Quant - 1) + 0.5)));
+        const int qv = std::max(0, std::min(Quant - 1, static_cast<int>(v * static_cast<double>(Quant - 1) + 0.5)));
+        const int qi = qv * Quant + qu;
+        if (job->uv_bins[static_cast<std::size_t>(qi)] != 0)
+        {
+            ++job->dedupe_skipped;
+            return false;
+        }
+        job->uv_bins[static_cast<std::size_t>(qi)] = 1;
+        TemplateUvBrushAsyncJob::TemplatePoint point{};
+        point.x = screen_x;
+        point.y = screen_y;
+        point.u = u;
+        point.v = v;
+        job->points.push_back(point);
+        return true;
+    }
+
+    auto artist_hit_to_point(const std::shared_ptr<TemplateUvBrushAsyncJob>& job, double screen_x, double screen_y) -> bool
+    {
+        meccha_sdk::RuntimePaintableComponent_HitTestAtScreenPosition hit{};
+        hit.MeshComponent = reinterpret_cast<void*>(job->mesh);
+        hit.ScreenPosition = meccha_sdk::FVector2D{screen_x, screen_y};
+        hit.PlayerController = reinterpret_cast<void*>(job->controller);
+        hit.bUseCachedTriangles = true;
+        std::string failure{};
+        if (!process_event(job->component, job->hit_test_function, reinterpret_cast<std::uint8_t*>(&hit), failure) || !hit.ReturnValue.bSuccess)
+        {
+            return false;
+        }
+        return artist_add_template_point(job, screen_x, screen_y, hit.ReturnValue.HitUV.X, hit.ReturnValue.HitUV.Y);
+    }
+
+    auto artist_call_two_bools_direct(std::uintptr_t object, std::uintptr_t function, bool first, bool second) -> bool
+    {
+        if (!object || !function)
+        {
+            return false;
+        }
+        const auto params_size = safe_read<int>(function + OffPropertiesSize, 0);
+        if (params_size <= 0 || params_size > 1024)
+        {
+            return false;
+        }
+        std::vector<std::uint8_t> params(static_cast<std::size_t>(params_size), 0);
+        int bool_index = 0;
+        for (auto prop = safe_read<std::uintptr_t>(function + OffChildProperties); prop; prop = safe_read<std::uintptr_t>(prop + OffFFieldNext))
+        {
+            const bool value = bool_index == 0 ? first : second;
+            if (write_bool(prop, params.data(), value))
+            {
+                ++bool_index;
+            }
+        }
+        std::string failure{};
+        return bool_index > 0 && process_event(object, function, params.data(), failure);
+    }
+
+    auto artist_capture_client_rgb(const std::shared_ptr<TemplateUvBrushAsyncJob>& job) -> bool
+    {
+        if (!job || job->viewport_width <= 0 || job->viewport_height <= 0)
+        {
+            return false;
+        }
+
+        POINT origin{0, 0};
+        HWND hwnd = GetForegroundWindow();
+        if (hwnd)
+        {
+            RECT client{};
+            if (GetClientRect(hwnd, &client))
+            {
+                ClientToScreen(hwnd, &origin);
+            }
+        }
+
+        const int width = job->viewport_width;
+        const int height = job->viewport_height;
+        HDC screen_dc = GetDC(nullptr);
+        if (!screen_dc)
+        {
+            return false;
+        }
+        HDC mem_dc = CreateCompatibleDC(screen_dc);
+        HBITMAP bitmap = mem_dc ? CreateCompatibleBitmap(screen_dc, width, height) : nullptr;
+        HGDIOBJ old_obj = bitmap ? SelectObject(mem_dc, bitmap) : nullptr;
+        bool ok = false;
+        if (mem_dc && bitmap && old_obj)
+        {
+            if (BitBlt(mem_dc, 0, 0, width, height, screen_dc, origin.x, origin.y, SRCCOPY | CAPTUREBLT))
+            {
+                BITMAPINFO bmi{};
+                bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                bmi.bmiHeader.biWidth = width;
+                bmi.bmiHeader.biHeight = -height;
+                bmi.bmiHeader.biPlanes = 1;
+                bmi.bmiHeader.biBitCount = 32;
+                bmi.bmiHeader.biCompression = BI_RGB;
+                std::vector<std::uint8_t> bgra(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4u);
+                if (GetDIBits(mem_dc, bitmap, 0, static_cast<UINT>(height), bgra.data(), &bmi, DIB_RGB_COLORS) == static_cast<int>(height))
+                {
+                    job->screen_rgb.assign(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3u, 0);
+                    for (int y = 0; y < height; ++y)
+                    {
+                        for (int x = 0; x < width; ++x)
+                        {
+                            const std::size_t src = (static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)) * 4u;
+                            const std::size_t dst = (static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)) * 3u;
+                            job->screen_rgb[dst + 0] = bgra[src + 2];
+                            job->screen_rgb[dst + 1] = bgra[src + 1];
+                            job->screen_rgb[dst + 2] = bgra[src + 0];
+                        }
+                    }
+                    job->screen_capture_width = width;
+                    job->screen_capture_height = height;
+                    job->screen_capture_origin_x = origin.x;
+                    job->screen_capture_origin_y = origin.y;
+                    job->source_path = "hidden_client_screenshot";
+                    ok = true;
+                }
+            }
+        }
+        if (old_obj)
+        {
+            SelectObject(mem_dc, old_obj);
+        }
+        if (bitmap)
+        {
+            DeleteObject(bitmap);
+        }
+        if (mem_dc)
+        {
+            DeleteDC(mem_dc);
+        }
+        ReleaseDC(nullptr, screen_dc);
+        return ok;
+    }
+
+    auto start_template_uv_brush_async_job(const std::string& request, const std::shared_ptr<QueuedPaintJob>& queued_job) -> bool
+    {
+        const bool trace_parity = request.find("\"native_apply_mode\":\"artist_trace_parity\"") != std::string::npos ||
+                                  request.find("\"route\":\"f10_artist_trace_parity\"") != std::string::npos;
+        {
+            std::lock_guard<std::mutex> lock(g_template_uv_brush_mutex);
+            if (g_template_uv_brush_job)
+            {
+                complete_template_uv_brush_job(std::make_shared<TemplateUvBrushAsyncJob>(TemplateUvBrushAsyncJob{queued_job}),
+                                               response_json(false,
+                                                             "artist_template_busy",
+                                                             0,
+                                                             1,
+                                                             "artist template brush job is already running",
+                                                             "\"route\":\"artist_template_brush_paint\""));
+                return true;
+            }
+        }
+
+        Reflection ref{};
+        std::string failure{};
+        if (!ref.init(failure))
+        {
+            complete_template_uv_brush_job(std::make_shared<TemplateUvBrushAsyncJob>(TemplateUvBrushAsyncJob{queued_job}),
+                                           response_json(false, "sdk_unavailable", 0, 1, failure));
+            return true;
+        }
+        const auto ctx = sdk_resolve_context(ref);
+        std::string metadata = sdk_context_metadata(ref, ctx);
+        metadata += std::string(",\"route\":\"") + (trace_parity ? "artist_trace_parity" : "artist_template_brush_paint") + "\"";
+        metadata += std::string(",\"artist_trace_parity\":") + json_bool(trace_parity);
+        metadata += ",\"artist_static_parity\":\"phase0_template_points_template_load\"";
+        metadata += ",\"texture_import_used\":false";
+        metadata += ",\"paint_at_uv_with_brush_used\":true";
+        metadata += ",\"paint_at_screen_position_used\":false";
+        metadata += ",\"live_set_hidden_in_game_used\":false";
+        metadata += ",\"high_gbuffer_batched_ported\":\"scene_capture_bulk_readback\"";
+        metadata += ",\"batched_source_required\":true";
+        metadata += ",\"uv_expand_enabled\":false";
+        metadata += ",\"screen_fill_enabled\":true";
+        metadata += ",\"artist_profile\":\"stable_scene_capture_template_trace\"";
+        metadata += ",\"inferred_fields\":[\"brush_radius_formula\",\"scene_capture_hide_component_as_hide_gbuffer_batched\"]";
+        if (!ctx.ok)
+        {
+            complete_template_uv_brush_job(std::make_shared<TemplateUvBrushAsyncJob>(TemplateUvBrushAsyncJob{queued_job}),
+                                           response_json(false, ctx.stage.c_str(), 0, 1, ctx.message, metadata));
+            return true;
+        }
+
+        const auto viewport = sdk_get_viewport_info(ref, ctx);
+        const auto mesh = sdk_find_front_mesh(ref, ctx);
+        const auto color_picker = sdk_find_color_picker_caller(ref);
+        const auto hit_test_function = ref.find_function(ctx.component, "HitTestAtScreenPosition");
+        const auto sample_function = color_picker ? ref.find_function(color_picker, "SampleViewportGBuffer") : 0;
+        const auto paint_uv_function = ctx.paint_at_uv_with_brush_function ? ctx.paint_at_uv_with_brush_function : ref.find_function(ctx.component, "PaintAtUVWithBrush");
+        const auto hide_function = mesh ? ref.find_function(mesh, "SetHiddenInGame") : 0;
+        const auto begin_stroke_function = ref.find_function(ctx.component, "BeginStroke");
+        const auto end_stroke_function = ref.find_function(ctx.component, "EndStroke");
+        const auto clear_recorded_function = ref.find_function(ctx.component, "ClearRecordedStrokes");
+        const auto flush_recorded_function = ref.find_function(ctx.component, "FlushRecordedStrokesToServer");
+        const auto send_batch_function = ref.find_function(ctx.component, "SendStrokeBatchToServer");
+
+        metadata += std::string(",\"viewport_available\":") + json_bool(viewport.width > 0 && viewport.height > 0);
+        metadata += ",\"viewport_width\":" + std::to_string(viewport.width);
+        metadata += ",\"viewport_height\":" + std::to_string(viewport.height);
+        metadata += std::string(",\"front_mesh_available\":") + json_bool(mesh != 0);
+        metadata += std::string(",\"color_picker_available\":") + json_bool(color_picker != 0);
+        metadata += std::string(",\"function_hit_test_at_screen_position_available\":") + json_bool(hit_test_function != 0);
+        metadata += std::string(",\"function_sample_viewport_gbuffer_available\":") + json_bool(sample_function != 0);
+        metadata += std::string(",\"function_paint_at_uv_with_brush_available\":") + json_bool(paint_uv_function != 0);
+        metadata += std::string(",\"function_set_hidden_in_game_available\":") + json_bool(hide_function != 0);
+        metadata += std::string(",\"function_begin_stroke_available\":") + json_bool(begin_stroke_function != 0);
+        metadata += std::string(",\"function_end_stroke_available\":") + json_bool(end_stroke_function != 0);
+        metadata += std::string(",\"function_flush_recorded_strokes_to_server_available\":") + json_bool(flush_recorded_function != 0);
+        metadata += std::string(",\"function_send_stroke_batch_to_server_available\":") + json_bool(send_batch_function != 0);
+
+        if (viewport.width <= 0 || viewport.height <= 0)
+        {
+            complete_template_uv_brush_job(std::make_shared<TemplateUvBrushAsyncJob>(TemplateUvBrushAsyncJob{queued_job}),
+                                           response_json(false, "viewport_unavailable", 0, 1, "viewport size is unavailable", metadata));
+            return true;
+        }
+        if (!mesh || !hit_test_function)
+        {
+            complete_template_uv_brush_job(std::make_shared<TemplateUvBrushAsyncJob>(TemplateUvBrushAsyncJob{queued_job}),
+                                           response_json(false, "artist_phase0_surface_unavailable", 0, 1, "front mesh HitTestAtScreenPosition is unavailable", metadata));
+            return true;
+        }
+        if (!paint_uv_function || !begin_stroke_function || !end_stroke_function)
+        {
+            complete_template_uv_brush_job(std::make_shared<TemplateUvBrushAsyncJob>(TemplateUvBrushAsyncJob{queued_job}),
+                                           response_json(false, "artist_template_paint_api_unavailable", 0, 1, "PaintAtUVWithBrush or stroke functions are unavailable", metadata));
+            return true;
+        }
+        if (!flush_recorded_function && !send_batch_function)
+        {
+            complete_template_uv_brush_job(std::make_shared<TemplateUvBrushAsyncJob>(TemplateUvBrushAsyncJob{queued_job}),
+                                           response_json(false, "artist_template_commit_unavailable", 0, 1, "recorded stroke flush functions are unavailable", metadata));
+            return true;
+        }
+
+        constexpr std::uintptr_t OffAutoRecordStrokes = 0x01AC;
+        constexpr std::uintptr_t OffAutoFlushStrokes = 0x01AD;
+        constexpr std::uintptr_t OffAutoFlushThreshold = 0x01B0;
+        constexpr std::uintptr_t OffCurrentBrushSettings = meccha_sdk::FieldOffsets::RuntimePaintable_CurrentBrushSettings;
+
+        auto job = std::make_shared<TemplateUvBrushAsyncJob>();
+        job->queued = queued_job;
+        job->trace_parity = trace_parity;
+        job->world = ctx.world;
+        job->controller = ctx.controller;
+        job->component = ctx.component;
+        job->mesh = mesh;
+        job->color_picker = color_picker;
+        job->hit_test_function = hit_test_function;
+        job->sample_function = sample_function;
+        job->paint_uv_function = paint_uv_function;
+        job->hide_function = hide_function;
+        job->begin_stroke_function = begin_stroke_function;
+        job->end_stroke_function = end_stroke_function;
+        job->clear_recorded_function = clear_recorded_function;
+        job->flush_recorded_function = flush_recorded_function;
+        job->send_batch_function = send_batch_function;
+        job->viewport_width = viewport.width;
+        job->viewport_height = viewport.height;
+        job->old_auto_record = safe_read<bool>(ctx.component + OffAutoRecordStrokes, false);
+        job->old_auto_flush = safe_read<bool>(ctx.component + OffAutoFlushStrokes, false);
+        job->old_auto_flush_threshold = safe_read<int>(ctx.component + OffAutoFlushThreshold, 0);
+        safe_copy(&job->old_brush, reinterpret_cast<const void*>(ctx.component + OffCurrentBrushSettings), sizeof(job->old_brush));
+        job->brush = job->old_brush;
+        job->brush.Hardness = 1.0f;
+        job->brush.Opacity = 1.0f;
+        job->brush.Spacing = 0.18f;
+        job->brush.Falloff = meccha_sdk::EBrushFalloff::Spherical;
+        job->brush.BlendMode = meccha_sdk::EPaintBlendMode::Normal;
+        job->metadata = metadata;
+        job->metadata += ",\"artist_base_cols\":" + std::to_string(job->base_cols);
+        job->metadata += ",\"artist_base_rows\":" + std::to_string(job->base_rows);
+        job->metadata += ",\"artist_dense_cols\":" + std::to_string(job->dense_cols);
+        job->metadata += ",\"artist_dense_rows\":" + std::to_string(job->dense_rows);
+        job->metadata += ",\"artist_point_target\":" + std::to_string(job->point_target);
+        job->started = std::chrono::steady_clock::now();
+        job->last_tick = job->started;
+        job->points.reserve(static_cast<std::size_t>(job->point_target));
+
+        {
+            std::lock_guard<std::mutex> lock(g_template_uv_brush_mutex);
+            g_template_uv_brush_job = job;
+        }
+        write_bridge_progress("artist_phase0_begin",
+                              "artist phase0 source generation started",
+                              0,
+                              100,
+                              0.0,
+                              "\"source_path\":\"scene_capture_hide_component_bulk_readback\"");
+        if (const auto thread_id = g_game_thread_id.load())
+        {
+            PostThreadMessageW(thread_id, PaintDispatchMessage, 0, 0);
+        }
+        return true;
+    }
+
+    auto tick_template_uv_brush_async_job() -> void
+    {
+        std::shared_ptr<TemplateUvBrushAsyncJob> job{};
+        {
+            std::lock_guard<std::mutex> lock(g_template_uv_brush_mutex);
+            job = g_template_uv_brush_job;
+        }
+        if (!job)
+        {
+            return;
+        }
+
+        auto post_next = []() {
+            if (const auto thread_id = g_game_thread_id.load())
+            {
+                PostThreadMessageW(thread_id, PaintDispatchMessage, 0, 0);
+            }
+        };
+        auto cleanup_state = [&]() {
+            constexpr std::uintptr_t OffAutoRecordStrokes = 0x01AC;
+            constexpr std::uintptr_t OffAutoFlushStrokes = 0x01AD;
+            constexpr std::uintptr_t OffAutoFlushThreshold = 0x01B0;
+            constexpr std::uintptr_t OffCurrentBrushSettings = meccha_sdk::FieldOffsets::RuntimePaintable_CurrentBrushSettings;
+            safe_copy(reinterpret_cast<void*>(job->component + OffAutoRecordStrokes), &job->old_auto_record, sizeof(job->old_auto_record));
+            safe_copy(reinterpret_cast<void*>(job->component + OffAutoFlushStrokes), &job->old_auto_flush, sizeof(job->old_auto_flush));
+            safe_copy(reinterpret_cast<void*>(job->component + OffAutoFlushThreshold), &job->old_auto_flush_threshold, sizeof(job->old_auto_flush_threshold));
+            safe_copy(reinterpret_cast<void*>(job->component + OffCurrentBrushSettings), &job->old_brush, sizeof(job->old_brush));
+        };
+        auto fail_job = [&](const char* stage, const std::string& message) {
+            cleanup_state();
+            complete_template_uv_brush_job(job,
+                                           response_json(false,
+                                                         stage,
+                                                         job->paint_success,
+                                                         1,
+                                                         message,
+                                                         job->metadata + ",\"route\":\"artist_template_brush_paint\",\"async_phase_failed\":true"));
+            {
+                std::lock_guard<std::mutex> lock(g_template_uv_brush_mutex);
+                if (g_template_uv_brush_job == job)
+                {
+                    g_template_uv_brush_job.reset();
+                }
+            }
+        };
+        auto job_elapsed_ms = [&]() {
+            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - job->started).count();
+        };
+
+        job->last_tick = std::chrono::steady_clock::now();
+
+        constexpr std::uintptr_t OffAutoRecordStrokes = 0x01AC;
+        constexpr std::uintptr_t OffAutoFlushStrokes = 0x01AD;
+        constexpr std::uintptr_t OffAutoFlushThreshold = 0x01B0;
+        constexpr std::uintptr_t OffCurrentBrushSettings = meccha_sdk::FieldOffsets::RuntimePaintable_CurrentBrushSettings;
+
+        switch (job->phase)
+        {
+        case TemplateUvBrushAsyncJob::Phase::Phase0BaseGrid:
+        {
+            constexpr int chunk = 768;
+            const int total = job->base_cols * job->base_rows;
+            const int end = std::min(total, job->next_index + chunk);
+            for (; job->next_index < end; ++job->next_index)
+            {
+                const int ix = job->next_index % job->base_cols;
+                const int iy = job->next_index / job->base_cols;
+                const double nx = 0.06 + ((static_cast<double>(ix) + 0.5) / static_cast<double>(job->base_cols)) * 0.88;
+                const double ny = 0.02 + ((static_cast<double>(iy) + 0.5) / static_cast<double>(job->base_rows)) * 0.96;
+                const double screen_x = nx * static_cast<double>(job->viewport_width);
+                const double screen_y = ny * static_cast<double>(job->viewport_height);
+                ++job->base_attempts;
+
+                meccha_sdk::RuntimePaintableComponent_HitTestAtScreenPosition hit{};
+                hit.MeshComponent = reinterpret_cast<void*>(job->mesh);
+                hit.ScreenPosition = meccha_sdk::FVector2D{screen_x, screen_y};
+                hit.PlayerController = reinterpret_cast<void*>(job->controller);
+                hit.bUseCachedTriangles = true;
+                std::string failure{};
+                if (!process_event(job->component, job->hit_test_function, reinterpret_cast<std::uint8_t*>(&hit), failure) || !hit.ReturnValue.bSuccess)
+                {
+                    continue;
+                }
+                ++job->base_hits;
+                job->bbox_min_nx = std::min(job->bbox_min_nx, nx);
+                job->bbox_min_ny = std::min(job->bbox_min_ny, ny);
+                job->bbox_max_nx = std::max(job->bbox_max_nx, nx);
+                job->bbox_max_ny = std::max(job->bbox_max_ny, ny);
+            }
+            const int percent = total > 0 ? static_cast<int>((static_cast<long long>(job->next_index) * 8LL) / total) : 8;
+            if (percent != job->progress_percent)
+            {
+                job->progress_percent = percent;
+                write_bridge_progress("artist_phase0_base_grid",
+                                      "phase0 base grid bounds",
+                                      percent,
+                                      100,
+                                      job_elapsed_ms(),
+                                      "\"base_hits\":" + std::to_string(job->base_hits) +
+                                          ",\"base_attempts\":" + std::to_string(job->base_attempts));
+            }
+            if (job->next_index >= total)
+            {
+                if (job->base_hits <= 0 || job->bbox_max_nx <= job->bbox_min_nx || job->bbox_max_ny <= job->bbox_min_ny)
+                {
+                    fail_job("artist_phase0_no_surface_bounds", "artist phase0 base grid found no surface bounds");
+                    return;
+                }
+                const double span_x = std::max(0.04, job->bbox_max_nx - job->bbox_min_nx);
+                const double span_y = std::max(0.04, job->bbox_max_ny - job->bbox_min_ny);
+                job->bbox_min_nx = clamp01(job->bbox_min_nx - span_x * 0.16);
+                job->bbox_max_nx = clamp01(job->bbox_max_nx + span_x * 0.16);
+                job->bbox_min_ny = clamp01(job->bbox_min_ny - span_y * 0.08);
+                job->bbox_max_ny = clamp01(job->bbox_max_ny + span_y * 0.14);
+                job->next_index = 0;
+                job->progress_percent = -1;
+                job->phase = TemplateUvBrushAsyncJob::Phase::Phase0Dense;
+            }
+            post_next();
+            return;
+        }
+        case TemplateUvBrushAsyncJob::Phase::Phase0Dense:
+        {
+            constexpr int chunk = 192;
+            const int total = job->dense_cols * job->dense_rows;
+            const int end = std::min(total, job->next_index + chunk);
+            for (; job->next_index < end; ++job->next_index)
+            {
+                const int ix = job->next_index % job->dense_cols;
+                const int iy = job->next_index / job->dense_cols;
+                const double tx = (static_cast<double>(ix) + 0.5) / static_cast<double>(job->dense_cols);
+                const double ty = (static_cast<double>(iy) + 0.5) / static_cast<double>(job->dense_rows);
+                const double nx = job->bbox_min_nx + (job->bbox_max_nx - job->bbox_min_nx) * tx;
+                const double ny = job->bbox_min_ny + (job->bbox_max_ny - job->bbox_min_ny) * ty;
+                ++job->dense_attempts;
+                if (artist_hit_to_point(job, nx * static_cast<double>(job->viewport_width), ny * static_cast<double>(job->viewport_height)))
+                {
+                    ++job->dense_hits;
+                }
+            }
+            const int percent = 8 + (total > 0 ? static_cast<int>((static_cast<long long>(job->next_index) * 24LL) / total) : 24);
+            if (percent != job->progress_percent)
+            {
+                job->progress_percent = percent;
+                write_bridge_progress("artist_phase0_dense",
+                                      "phase0 dense surface samples",
+                                      percent,
+                                      100,
+                                      job_elapsed_ms(),
+                                      "\"points\":" + std::to_string(job->points.size()) +
+                                          ",\"dense_hits\":" + std::to_string(job->dense_hits) +
+                                          ",\"dense_attempts\":" + std::to_string(job->dense_attempts));
+            }
+            if (job->next_index >= total)
+            {
+                job->progress_percent = -1;
+                std::sort(job->points.begin(), job->points.end(), [](const auto& a, const auto& b) {
+                    if (a.y == b.y) return a.x < b.x;
+                    return a.y < b.y;
+                });
+                job->source_sorted = true;
+                job->screen_fill_index = 0;
+                job->progress_percent = -1;
+                job->phase = static_cast<int>(job->points.size()) < job->point_target
+                    ? TemplateUvBrushAsyncJob::Phase::Phase0ScreenFill
+                    : TemplateUvBrushAsyncJob::Phase::CaptureSource;
+            }
+            post_next();
+            return;
+        }
+        case TemplateUvBrushAsyncJob::Phase::Phase0LowerRescan:
+        {
+            constexpr int chunk = 192;
+            const int total = job->lower_cols * job->lower_rows;
+            const int end = std::min(total, job->next_index + chunk);
+            const double lower_start = job->bbox_min_ny + (job->bbox_max_ny - job->bbox_min_ny) * 0.48;
+            for (; job->next_index < end && static_cast<int>(job->points.size()) < job->point_target; ++job->next_index)
+            {
+                const int ix = job->next_index % job->lower_cols;
+                const int iy = job->next_index / job->lower_cols;
+                const double tx = (static_cast<double>(ix) + 0.5) / static_cast<double>(job->lower_cols);
+                const double ty = (static_cast<double>(iy) + 0.5) / static_cast<double>(job->lower_rows);
+                const double nx = job->bbox_min_nx + (job->bbox_max_nx - job->bbox_min_nx) * tx;
+                const double ny = lower_start + (job->bbox_max_ny - lower_start) * ty;
+                ++job->lower_attempts;
+                if (artist_hit_to_point(job, nx * static_cast<double>(job->viewport_width), ny * static_cast<double>(job->viewport_height)))
+                {
+                    ++job->lower_hits;
+                }
+            }
+            const int percent = 32 + (total > 0 ? static_cast<int>((static_cast<long long>(job->next_index) * 8LL) / total) : 8);
+            if (percent != job->progress_percent)
+            {
+                job->progress_percent = percent;
+                write_bridge_progress("artist_phase0_lower_rescan",
+                                      "phase0 lower rescan",
+                                      percent,
+                                      100,
+                                      job_elapsed_ms(),
+                                      "\"points\":" + std::to_string(job->points.size()) +
+                                          ",\"lower_hits\":" + std::to_string(job->lower_hits));
+            }
+            if (job->next_index >= total || static_cast<int>(job->points.size()) >= job->point_target)
+            {
+                job->progress_percent = -1;
+                std::sort(job->points.begin(), job->points.end(), [](const auto& a, const auto& b) {
+                    if (a.y == b.y) return a.x < b.x;
+                    return a.y < b.y;
+                });
+                job->source_sorted = true;
+                job->phase = TemplateUvBrushAsyncJob::Phase::CaptureSource;
+            }
+            post_next();
+            return;
+        }
+        case TemplateUvBrushAsyncJob::Phase::Phase0UvExpand:
+        {
+            const int original_count = static_cast<int>(job->points.size());
+            if (original_count <= 0)
+            {
+                fail_job("artist_phase0_no_template_points", "artist phase0 produced no template points");
+                return;
+            }
+            constexpr int chunk = 2400;
+            const int end = std::min(original_count, job->uv_expand_index + chunk);
+            const double uv_delta = 0.0019;
+            for (; job->uv_expand_index < end && static_cast<int>(job->points.size()) < job->point_target; ++job->uv_expand_index)
+            {
+                if ((job->uv_expand_index % 3) != 0)
+                {
+                    continue;
+                }
+                const auto p = job->points[static_cast<std::size_t>(job->uv_expand_index)];
+                if (artist_add_template_point(job, p.x, p.y, p.u + uv_delta, p.v)) ++job->uv_expand_added;
+                if (artist_add_template_point(job, p.x, p.y, p.u - uv_delta, p.v)) ++job->uv_expand_added;
+                if (artist_add_template_point(job, p.x, p.y, p.u, p.v + uv_delta)) ++job->uv_expand_added;
+                if (artist_add_template_point(job, p.x, p.y, p.u, p.v - uv_delta)) ++job->uv_expand_added;
+            }
+            const int percent = 40 + static_cast<int>((static_cast<long long>(job->uv_expand_index) * 6LL) / std::max(1, original_count));
+            if (percent != job->progress_percent)
+            {
+                job->progress_percent = percent;
+                write_bridge_progress("artist_phase0_uv_expand",
+                                      "phase0 uv expand",
+                                      percent,
+                                      100,
+                                      job_elapsed_ms(),
+                                      "\"points\":" + std::to_string(job->points.size()) +
+                                          ",\"uv_expand_added\":" + std::to_string(job->uv_expand_added));
+            }
+            if (job->uv_expand_index >= original_count || static_cast<int>(job->points.size()) >= job->point_target)
+            {
+                job->screen_fill_index = 0;
+                job->progress_percent = -1;
+                std::sort(job->points.begin(), job->points.end(), [](const auto& a, const auto& b) {
+                    if (a.y == b.y) return a.x < b.x;
+                    return a.y < b.y;
+                });
+                job->phase = TemplateUvBrushAsyncJob::Phase::Phase0ScreenFill;
+            }
+            post_next();
+            return;
+        }
+        case TemplateUvBrushAsyncJob::Phase::Phase0ScreenFill:
+        {
+            const int original_count = static_cast<int>(job->points.size());
+            constexpr int chunk = 3200;
+            const int fill_target = std::min(job->point_target, std::max(original_count + 1, original_count * 2));
+            const int end = std::min(original_count - 1, job->screen_fill_index + chunk);
+            const double max_dx = static_cast<double>(job->viewport_width) * 0.018;
+            const double max_dy = static_cast<double>(job->viewport_height) * 0.004;
+            for (; job->screen_fill_index < end && static_cast<int>(job->points.size()) < fill_target; ++job->screen_fill_index)
+            {
+                const auto& a = job->points[static_cast<std::size_t>(job->screen_fill_index)];
+                const auto& b = job->points[static_cast<std::size_t>(job->screen_fill_index + 1)];
+                if (std::abs(a.y - b.y) > max_dy || std::abs(a.x - b.x) > max_dx)
+                {
+                    continue;
+                }
+                const double du = std::abs(a.u - b.u);
+                const double dv = std::abs(a.v - b.v);
+                if (du > 0.018 || dv > 0.018)
+                {
+                    continue;
+                }
+                if (artist_add_template_point(job, (a.x + b.x) * 0.5, (a.y + b.y) * 0.5, (a.u + b.u) * 0.5, (a.v + b.v) * 0.5))
+                {
+                    ++job->screen_fill_added;
+                }
+            }
+            const int percent = 46 + static_cast<int>((static_cast<long long>(job->screen_fill_index) * 6LL) / std::max(1, original_count));
+            if (percent != job->progress_percent)
+            {
+                job->progress_percent = percent;
+                write_bridge_progress("artist_phase0_screen_fill",
+                                      "phase0 screen fill",
+                                      percent,
+                                      100,
+                                      job_elapsed_ms(),
+                                      "\"points\":" + std::to_string(job->points.size()) +
+                                          ",\"screen_fill_added\":" + std::to_string(job->screen_fill_added));
+            }
+            if (job->screen_fill_index >= original_count - 1 || static_cast<int>(job->points.size()) >= fill_target)
+            {
+                std::sort(job->points.begin(), job->points.end(), [](const auto& a, const auto& b) {
+                    if (a.y == b.y) return a.x < b.x;
+                    return a.y < b.y;
+                });
+                job->source_sorted = true;
+                job->capture_index = 0;
+                job->progress_percent = -1;
+                job->phase = TemplateUvBrushAsyncJob::Phase::CaptureSource;
+            }
+            post_next();
+            return;
+        }
+        case TemplateUvBrushAsyncJob::Phase::CaptureSource:
+        {
+            if (job->points.empty())
+            {
+                fail_job("artist_phase0_no_template_points", "artist phase0 produced no template points");
+                return;
+            }
+
+            Reflection ref{};
+            std::string init_failure{};
+            if (!ref.init(init_failure))
+            {
+                fail_job("sdk_unavailable", init_failure.empty() ? "SDK reflection init failed" : init_failure);
+                return;
+            }
+            const auto ctx = sdk_resolve_context(ref);
+            if (!ctx.ok)
+            {
+                fail_job(ctx.stage.c_str(), ctx.message);
+                return;
+            }
+            const auto live_viewport = sdk_get_viewport_info(ref, ctx);
+            if (live_viewport.width > 0 && live_viewport.height > 0 &&
+                (live_viewport.width != job->viewport_width || live_viewport.height != job->viewport_height))
+            {
+                const double sx = static_cast<double>(live_viewport.width) / static_cast<double>(std::max(1, job->viewport_width));
+                const double sy = static_cast<double>(live_viewport.height) / static_cast<double>(std::max(1, job->viewport_height));
+                for (auto& point : job->points)
+                {
+                    point.x *= sx;
+                    point.y *= sy;
+                }
+                job->viewport_width = live_viewport.width;
+                job->viewport_height = live_viewport.height;
+                job->metadata += ",\"artist_viewport_refreshed_before_capture\":true";
+                job->metadata += ",\"artist_live_viewport_width\":" + std::to_string(live_viewport.width);
+                job->metadata += ",\"artist_live_viewport_height\":" + std::to_string(live_viewport.height);
+            }
+
+            SdkNativeFrontSampleResult native_front{};
+            native_front.mesh = job->mesh;
+            native_front.hit_test_function = job->hit_test_function;
+            native_front.viewport_width = job->viewport_width;
+            native_front.viewport_height = job->viewport_height;
+            native_front.sampling_backend = "artist_template_points_cached_hit_test";
+            native_front.min_front_hits = std::max(64, std::min(2048, static_cast<int>(job->points.size())));
+            native_front.target_front_hits = static_cast<int>(job->points.size());
+            native_front.target_unique_atlas_texels = 0;
+            native_front.hard_attempt_budget = job->base_attempts + job->dense_attempts + job->lower_attempts;
+            native_front.samples.reserve(job->points.size());
+            for (const auto& point : job->points)
+            {
+                FrontSample sample{};
+                sample.u = clamp01(point.u);
+                sample.v = clamp01(point.v);
+                sample.screen_nx = clamp01(point.x / static_cast<double>(std::max(1, job->viewport_width)));
+                sample.screen_ny = clamp01(point.y / static_cast<double>(std::max(1, job->viewport_height)));
+                sample.radius = 0.006;
+                sample.metallic = 0.0;
+                sample.roughness = 0.65;
+                native_front.samples.push_back(sample);
+            }
+
+            write_bridge_progress("artist_phase0_hide_gbuffer_batched",
+                                  "phase0 hide_gbuffer_batched capture started",
+                                  52,
+                                  100,
+                                  job_elapsed_ms(),
+                                  "\"template_points\":" + std::to_string(job->points.size()) +
+                                      ",\"source_path\":\"hide_gbuffer_batched\"");
+
+            constexpr int kArtistCaptureMaxDimension = 1600;
+            int capture_request_width = std::max(1, job->viewport_width);
+            int capture_request_height = std::max(1, job->viewport_height);
+            const int request_max_dimension = std::max(capture_request_width, capture_request_height);
+            if (request_max_dimension > kArtistCaptureMaxDimension)
+            {
+                const double scale = static_cast<double>(kArtistCaptureMaxDimension) / static_cast<double>(request_max_dimension);
+                capture_request_width = std::max(1, static_cast<int>(std::round(static_cast<double>(capture_request_width) * scale)));
+                capture_request_height = std::max(1, static_cast<int>(std::round(static_cast<double>(capture_request_height) * scale)));
+            }
+            const auto capture_started = std::chrono::steady_clock::now();
+            const auto capture = sdk_capture_front_colors(ref, ctx, native_front, capture_request_width, capture_request_height);
+            const auto capture_elapsed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - capture_started).count();
+            job->metadata += sdk_capture_metadata(capture);
+            job->metadata += ",\"artist_capture_request_width\":" + std::to_string(capture_request_width);
+            job->metadata += ",\"artist_capture_request_height\":" + std::to_string(capture_request_height);
+            job->metadata += ",\"artist_capture_elapsed_ms\":" + std::to_string(capture_elapsed_ms);
+            if (!capture.bulk_readback_used || !capture.image_bulk_calibration_ok || capture.samples.empty())
+            {
+                fail_job("artist_hide_gbuffer_batched_unavailable", "hide_gbuffer_batched bulk capture failed: " + capture.failure);
+                return;
+            }
+
+            job->points.clear();
+            job->points.reserve(capture.samples.size());
+            for (const auto& sample : capture.samples)
+            {
+                TemplateUvBrushAsyncJob::TemplatePoint point{};
+                point.x = clamp01(sample.screen_nx) * static_cast<double>(job->viewport_width);
+                point.y = clamp01(sample.screen_ny) * static_cast<double>(job->viewport_height);
+                point.u = clamp01(sample.u);
+                point.v = clamp01(sample.v);
+                point.r = clamp01(sample.r);
+                point.g = clamp01(sample.g);
+                point.b = clamp01(sample.b);
+                point.metallic = clamp01(sample.metallic);
+                point.roughness = clamp01(std::max(0.35, sample.roughness));
+                point.has_color = true;
+                job->points.push_back(point);
+                ++job->gbuffer_success;
+                job->rgb_min = std::min(job->rgb_min, std::min(point.r, std::min(point.g, point.b)));
+                job->rgb_max = std::max(job->rgb_max, std::max(point.r, std::max(point.g, point.b)));
+                job->rgb_sum_r += point.r;
+                job->rgb_sum_g += point.g;
+                job->rgb_sum_b += point.b;
+                job->metallic_sum += point.metallic;
+                job->roughness_sum += point.roughness;
+            }
+            job->source_path = "hide_gbuffer_batched";
+            job->screen_capture_ready = true;
+            std::sort(job->points.begin(), job->points.end(), [](const auto& a, const auto& b) {
+                if (a.y == b.y) return a.x < b.x;
+                return a.y < b.y;
+            });
+            write_bridge_progress("artist_phase0_hide_gbuffer_batched_done",
+                                  "phase0 hide_gbuffer_batched capture done",
+                                  60,
+                                  100,
+                                  job_elapsed_ms(),
+                                  "\"source_path\":\"hide_gbuffer_batched\"" +
+                                      std::string(",\"bulk_readback_used\":") + json_bool(capture.bulk_readback_used) +
+                                      ",\"capture_samples\":" + std::to_string(capture.samples.size()) +
+                                      ",\"bulk_backend\":\"" + json_escape(capture.bulk_backend) + "\"");
+            job->phase = TemplateUvBrushAsyncJob::Phase::BeginPaint;
+            job->progress_percent = -1;
+            post_next();
+            return;
+        }
+        case TemplateUvBrushAsyncJob::Phase::BeginPaint:
+        {
+            const int template_count = static_cast<int>(job->points.size());
+            if (template_count <= 0)
+            {
+                fail_job("artist_template_points_unavailable", "artist route produced no direct template points; uv_expand/screen_fill are disabled");
+                return;
+            }
+            job->paint_tick_budget_ms = 2.0;
+            job->max_paints_per_tick = template_count > 12000 ? 72 : 64;
+            job->auto_flush_threshold = std::max(8192, std::min(32768, template_count));
+            const bool enabled = true;
+            const bool disabled = false;
+            safe_copy(reinterpret_cast<void*>(job->component + OffAutoRecordStrokes), &enabled, sizeof(enabled));
+            safe_copy(reinterpret_cast<void*>(job->component + OffAutoFlushStrokes), &disabled, sizeof(disabled));
+            safe_copy(reinterpret_cast<void*>(job->component + OffAutoFlushThreshold), &job->auto_flush_threshold, sizeof(job->auto_flush_threshold));
+            const double radius = std::max(0.0016, std::min(0.0042, 0.58 / std::sqrt(static_cast<double>(std::max(1, template_count)))));
+            job->brush_radius = radius;
+            job->brush.Radius = static_cast<float>(radius);
+            job->brush.Spacing = 0.08f;
+            safe_copy(reinterpret_cast<void*>(job->component + OffCurrentBrushSettings), &job->brush, sizeof(job->brush));
+            if (job->clear_recorded_function)
+            {
+                std::uint8_t params[1]{};
+                std::string failure{};
+                job->clear_called = process_event(job->component, job->clear_recorded_function, params, failure);
+            }
+            if (job->begin_stroke_function)
+            {
+                std::uint8_t params[1]{};
+                std::string failure{};
+                job->begin_called = process_event(job->component, job->begin_stroke_function, params, failure);
+            }
+            if (!job->begin_called)
+            {
+                fail_job("artist_template_begin_stroke_failed", "BeginStroke failed for artist template brush route");
+                return;
+            }
+            write_bridge_progress("artist_template_load_begin",
+                                  "template_load BeginStroke and auto flush configured",
+                                  62,
+                                  100,
+                                  job_elapsed_ms(),
+                                      "\"template_points\":" + std::to_string(job->points.size()) +
+                                      ",\"gbuffer_prefetched\":" + std::to_string(job->gbuffer_success) +
+                                      ",\"gbuffer_streamed\":false" +
+                                      ",\"source_path\":\"" + json_escape(job->source_path) + "\"" +
+                                      ",\"albedo_transfer\":\"identity_capture_rgb_for_paint_channel\"" +
+                                      ",\"lower_rescan_enabled\":false" +
+                                      ",\"auto_flush_during_paint\":false" +
+                                      ",\"delayed_clear_after_done\":false" +
+                                      ",\"paint_tick_budget_ms\":" + std::to_string(job->paint_tick_budget_ms) +
+                                      ",\"max_paints_per_tick\":" + std::to_string(job->max_paints_per_tick) +
+                                      ",\"brush_radius\":" + std::to_string(job->brush_radius) +
+                                      ",\"auto_flush_threshold\":" + std::to_string(job->auto_flush_threshold));
+            job->paint_index = 0;
+            job->phase = TemplateUvBrushAsyncJob::Phase::PaintBrush;
+            post_next();
+            return;
+        }
+        case TemplateUvBrushAsyncJob::Phase::PaintBrush:
+        {
+            const auto paint_tick_start = std::chrono::steady_clock::now();
+            const int total_points = static_cast<int>(job->points.size());
+            int painted_this_tick = 0;
+            int visited_this_tick = 0;
+            for (; job->paint_index < total_points; ++job->paint_index)
+            {
+                if (visited_this_tick > 0)
+                {
+                    const auto tick_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - paint_tick_start).count();
+                    if (tick_ms >= job->paint_tick_budget_ms ||
+                        painted_this_tick >= job->max_paints_per_tick ||
+                        visited_this_tick >= job->max_paints_per_tick * 2)
+                    {
+                        break;
+                    }
+                }
+                ++visited_this_tick;
+                auto& point = job->points[static_cast<std::size_t>(job->paint_index)];
+                if (!point.has_color)
+                {
+                    ++job->process_failures;
+                    if (job->first_failure.empty())
+                    {
+                        job->first_failure = "template point missing batched source color";
+                    }
+                    continue;
+                }
+                meccha_sdk::RuntimePaintableComponent_PaintAtUVWithBrush paint{};
+                paint.Uv = meccha_sdk::FVector2D{point.u, point.v};
+                paint.ChannelData = sdk_make_channel(point.r, point.g, point.b, point.metallic, point.roughness, meccha_sdk::EPaintChannelApplyMode::Override);
+                paint.BrushSettings = job->brush;
+                paint.Channel = meccha_sdk::EPaintChannel::AlbedoMetallicRoughness;
+                std::string failure{};
+                if (!process_event(job->component, job->paint_uv_function, reinterpret_cast<std::uint8_t*>(&paint), failure))
+                {
+                    ++job->process_failures;
+                    if (job->first_failure.empty())
+                    {
+                        job->first_failure = failure.empty() ? "PaintAtUVWithBrush failed" : failure;
+                    }
+                    continue;
+                }
+                ++job->paint_success;
+                ++painted_this_tick;
+            }
+            const int denom = std::max(1, total_points);
+            const int percent = 62 + static_cast<int>((static_cast<long long>(job->paint_index) * 36LL) / denom);
+            if (percent != job->progress_percent)
+            {
+                job->progress_percent = percent;
+                write_bridge_progress("artist_template_load_paint",
+                                      "template_load PaintAtUVWithBrush stream",
+                                      percent,
+                                      100,
+                                      job_elapsed_ms(),
+                                      "\"paint\":" + std::to_string(job->paint_success) +
+                                          ",\"index\":" + std::to_string(job->paint_index) +
+                                          ",\"points\":" + std::to_string(job->points.size()) +
+                                          ",\"painted_this_tick\":" + std::to_string(painted_this_tick) +
+                                          ",\"commit_pulses\":" + std::to_string(job->commit_pulses));
+            }
+            if (job->paint_index >= static_cast<int>(job->points.size()))
+            {
+                job->phase = TemplateUvBrushAsyncJob::Phase::Finish;
+            }
+            post_next();
+            return;
+        }
+        case TemplateUvBrushAsyncJob::Phase::Finish:
+        {
+            if (job->end_stroke_function)
+            {
+                std::uint8_t params[1]{};
+                std::string failure{};
+                job->end_called = process_event(job->component, job->end_stroke_function, params, failure);
+            }
+            if (job->flush_recorded_function)
+            {
+                std::uint8_t params[1]{};
+                std::string failure{};
+                job->flush_called = process_event(job->component, job->flush_recorded_function, params, failure);
+            }
+            if (job->send_batch_function)
+            {
+                std::uint8_t params[1]{};
+                std::string failure{};
+                job->send_batch_called = process_event(job->component, job->send_batch_function, params, failure);
+            }
+            cleanup_state();
+
+            const double denom = std::max(1, job->gbuffer_success);
+            std::string metadata = job->metadata;
+            metadata += ",\"source_path\":\"" + json_escape(job->source_path) + "\"";
+            metadata += std::string(",\"screen_capture_attempted\":") + json_bool(job->screen_capture_attempted);
+            metadata += std::string(",\"screen_capture_ready\":") + json_bool(job->screen_capture_ready);
+            metadata += ",\"screen_capture_width\":" + std::to_string(job->screen_capture_width);
+            metadata += ",\"screen_capture_height\":" + std::to_string(job->screen_capture_height);
+            metadata += ",\"screen_capture_origin_x\":" + std::to_string(job->screen_capture_origin_x);
+            metadata += ",\"screen_capture_origin_y\":" + std::to_string(job->screen_capture_origin_y);
+            metadata += std::string(",\"hide_called\":") + json_bool(job->hide_called);
+            metadata += std::string(",\"restore_called\":") + json_bool(job->restore_called);
+            metadata += ",\"phase0_base_hits\":" + std::to_string(job->base_hits);
+            metadata += ",\"phase0_base_attempts\":" + std::to_string(job->base_attempts);
+            metadata += ",\"phase0_dense_hits\":" + std::to_string(job->dense_hits);
+            metadata += ",\"phase0_dense_attempts\":" + std::to_string(job->dense_attempts);
+            metadata += ",\"phase0_lower_hits\":" + std::to_string(job->lower_hits);
+            metadata += ",\"phase0_lower_attempts\":" + std::to_string(job->lower_attempts);
+            metadata += ",\"phase0_uv_expand_added\":" + std::to_string(job->uv_expand_added);
+            metadata += ",\"phase0_screen_fill_added\":" + std::to_string(job->screen_fill_added);
+            metadata += ",\"template_points\":" + std::to_string(job->points.size());
+            metadata += ",\"template_dedupe_skipped\":" + std::to_string(job->dedupe_skipped);
+            metadata += ",\"template_brush_radius\":" + std::to_string(job->brush_radius);
+            metadata += ",\"template_paint_tick_budget_ms\":" + std::to_string(job->paint_tick_budget_ms);
+            metadata += ",\"template_max_paints_per_tick\":" + std::to_string(job->max_paints_per_tick);
+            metadata += ",\"template_auto_flush_threshold\":" + std::to_string(job->auto_flush_threshold);
+            metadata += ",\"gbuffer_success\":" + std::to_string(job->gbuffer_success);
+            metadata += ",\"paint_uv_success\":" + std::to_string(job->paint_success);
+            metadata += ",\"paint_process_failures\":" + std::to_string(job->process_failures);
+            metadata += ",\"template_commit_pulses\":" + std::to_string(job->commit_pulses);
+            metadata += std::string(",\"clear_recorded_strokes_called\":") + json_bool(job->clear_called);
+            metadata += std::string(",\"begin_stroke_called\":") + json_bool(job->begin_called);
+            metadata += std::string(",\"end_stroke_called\":") + json_bool(job->end_called);
+            metadata += std::string(",\"flush_recorded_strokes_to_server_called\":") + json_bool(job->flush_called);
+            metadata += std::string(",\"send_stroke_batch_to_server_called\":") + json_bool(job->send_batch_called);
+            metadata += ",\"gbuffer_rgb_min\":" + std::to_string(job->rgb_min);
+            metadata += ",\"gbuffer_rgb_max\":" + std::to_string(job->rgb_max);
+            metadata += ",\"gbuffer_rgb_avg_r\":" + std::to_string(job->rgb_sum_r / denom);
+            metadata += ",\"gbuffer_rgb_avg_g\":" + std::to_string(job->rgb_sum_g / denom);
+            metadata += ",\"gbuffer_rgb_avg_b\":" + std::to_string(job->rgb_sum_b / denom);
+            metadata += ",\"gbuffer_metallic_avg\":" + std::to_string(job->metallic_sum / denom);
+            metadata += ",\"gbuffer_roughness_avg\":" + std::to_string(job->roughness_sum / denom);
+            metadata += std::string(",\"first_failure\":\"") + json_escape(job->first_failure) + "\"";
+            metadata += ",\"bridge_events\":[\"artist_phase0_begin\",\"artist_template_points_done\",\"artist_template_load_done\"]";
+
+            write_bridge_progress("artist_template_load_done",
+                                  "artist template brush paint completed",
+                                  100,
+                                  100,
+                                  job_elapsed_ms(),
+                                  "\"paint\":" + std::to_string(job->paint_success) +
+                                      ",\"gbuffer\":" + std::to_string(job->gbuffer_success) +
+                                      ",\"points\":" + std::to_string(job->points.size()));
+            const bool ok = job->paint_success > 0 && job->end_called && (job->flush_called || job->send_batch_called);
+            complete_template_uv_brush_job(job,
+                                           response_json(ok,
+                                                         ok ? "artist_template_brush_paint_done" : "template_commit_failed",
+                                                         job->paint_success,
+                                                         ok ? 0 : 1,
+                                                         ok ? "artist-style template brush paint completed" : "artist-style template brush paint did not commit",
+                                                         metadata));
+            {
+                std::lock_guard<std::mutex> lock(g_template_uv_brush_mutex);
+                if (g_template_uv_brush_job == job)
+                {
+                    g_template_uv_brush_job.reset();
+                }
+            }
+            return;
+        }
+        }
+    }
+
+
     auto sdk_paint_full_route_native_direct(const std::string& request) -> std::string
     {
         const auto start = std::chrono::steady_clock::now();
@@ -8903,11 +10472,12 @@ namespace
         const bool is_deep_probe = request.find("\"type\":\"sdk_deep_probe\"") != std::string::npos ||
                                    request.find("\"native_apply_mode\":\"sdk_deep_probe_only\"") != std::string::npos;
         const bool legacy_diagnostic_import = false;
-        const bool texture_sync_probe = request.find("\"native_apply_mode\":\"texture_sync_strict_probe\"") != std::string::npos ||
-                                        request.find("\"route\":\"f10_texture_sync_strict_probe\"") != std::string::npos;
-        const bool static_hybrid_probe = request.find("\"native_apply_mode\":\"static_hybrid_front_side\"") != std::string::npos ||
-                                         request.find("\"native_apply_mode\":\"static_hybrid_front_side_probe\"") != std::string::npos ||
-                                         request.find("\"route\":\"f10_static_hybrid_front_side_probe\"") != std::string::npos;
+        const bool texture_sync_probe = false;
+        const bool static_hybrid_probe = false;
+        const bool template_uv_brush_probe = request.find("\"native_apply_mode\":\"artist_template_brush_paint\"") != std::string::npos ||
+                                             request.find("\"route\":\"f10_artist_template_brush_paint\"") != std::string::npos ||
+                                             request.find("\"native_apply_mode\":\"artist_trace_parity\"") != std::string::npos ||
+                                             request.find("\"route\":\"f10_artist_trace_parity\"") != std::string::npos;
         const bool color_transfer_probe = false;
         const bool front_texture_import = texture_sync_probe || static_hybrid_probe;
         const bool strict_38923_front_texture_import = texture_sync_probe;
@@ -8921,17 +10491,18 @@ namespace
         const bool disabled_mesh_route = false;
         const bool front_metallic_texture_route = disabled_metallic_stream;
         const bool front_paint_route = false;
-        const std::string route_name = static_hybrid_probe ? "static_hybrid_front_side" :
-                                       (texture_sync_probe ? "texture_sync_strict_probe" : "unsupported_route");
-        if (!is_probe && !is_deep_probe && !texture_sync_probe && !static_hybrid_probe)
+        const bool artist_trace_parity_route = request.find("\"native_apply_mode\":\"artist_trace_parity\"") != std::string::npos ||
+                                               request.find("\"route\":\"f10_artist_trace_parity\"") != std::string::npos;
+        const std::string route_name = template_uv_brush_probe ? (artist_trace_parity_route ? "artist_trace_parity" : "artist_template_brush_paint") : "unsupported_route";
+        if (!is_probe && !is_deep_probe && !texture_sync_probe && !static_hybrid_probe && !template_uv_brush_probe)
         {
             return response_json(false,
                                  "unsupported_route",
                                  0,
                                  1,
-                                 "unsupported native apply mode; only texture_sync_strict_probe and static_hybrid_front_side are available",
+                                 "unsupported native apply mode; only artist_template_brush_paint and artist_trace_parity are available",
                                  std::string("\"route\":\"") + json_escape(route_name) + "\"" +
-                                     ",\"supported_native_apply_modes\":[\"texture_sync_strict_probe\",\"static_hybrid_front_side\",\"static_hybrid_front_side_probe\"]");
+                                     ",\"supported_native_apply_modes\":[\"artist_template_brush_paint\",\"artist_trace_parity\"]");
         }
         static volatile LONG paint_busy = 0;
         static volatile LONG dump_busy = 0;
@@ -9011,7 +10582,7 @@ namespace
             const auto stage = is_probe ? ctx.stage : std::string("sdk_context_unavailable");
             return response_json(false, stage.c_str(), 0, 1, ctx.message, metadata);
         }
-        if (!front_texture_import && !static_hybrid_probe && !is_probe && !is_deep_probe && !sdk_has_replicated_api(ctx))
+        if (!front_texture_import && !static_hybrid_probe && !template_uv_brush_probe && !is_probe && !is_deep_probe && !sdk_has_replicated_api(ctx))
         {
             return response_json(false,
                                  "replicated_api_unavailable",
@@ -9019,6 +10590,15 @@ namespace
                                  1,
                                  "ServerPaintBatch replicated paint RPC is unavailable",
                                  metadata + ",\"bridge_events\":[\"replicated_api_unavailable\"]");
+        }
+        if (template_uv_brush_probe)
+        {
+            return response_json(false,
+                                 "artist_template_requires_async_dispatch",
+                                 0,
+                                 1,
+                                 "artist template brush route must run through the game-thread async dispatcher",
+                                 metadata + ",\"route\":\"" + json_escape(route_name) + "\",\"async_dispatch_required\":true");
         }
         if (is_deep_probe)
         {
@@ -10658,6 +12238,7 @@ namespace
 
     auto drain_paint_jobs_on_game_thread() -> void
     {
+        tick_template_uv_brush_async_job();
         std::vector<std::shared_ptr<QueuedPaintJob>> jobs{};
         {
             std::lock_guard<std::mutex> lock(g_paint_jobs_mutex);
@@ -10667,6 +12248,11 @@ namespace
         {
             if (!job)
             {
+                continue;
+            }
+            if (is_template_uv_brush_request(job->request))
+            {
+                start_template_uv_brush_async_job(job->request, job);
                 continue;
             }
             const auto response = paint_full_route_native_direct(job->request);
