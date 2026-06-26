@@ -2762,9 +2762,9 @@ namespace
         std::string sampling_backend{"unset"};
         int viewport_width{0};
         int viewport_height{0};
-        int min_front_hits{2048};
-        int target_front_hits{220000};
-        int hard_attempt_budget{600000};
+        int min_front_hits{0};
+        int target_front_hits{0};
+        int hard_attempt_budget{0};
     };
 
     struct SdkFrontCaptureResult
@@ -5341,19 +5341,23 @@ namespace
         std::uintptr_t server_paint_batch_function{0};
         int viewport_width{0};
         int viewport_height{0};
-        int base_cols{54};
-        int base_rows{86};
-        int dense_rows{640};
+        int base_cols{0};
+        int base_rows{0};
+        int dense_rows{0};
         int next_index{0};
         int capture_index{0};
         int replicate_index{0};
-        int point_target{60000};
+        int point_target{0};
+        int coverage_sample_target{0};
+        int coverage_candidate_target{0};
         int paint_sample_attempts{0};
         int paint_sample_success{0};
         int paint_sample_failures{0};
         int sampler_probe_attempts{0};
         int sampler_probe_misses{0};
         int candidate_count{0};
+        int points_before_downsample{0};
+        int downsample_removed{0};
         double silhouette_area_px{0.0};
         int base_attempts{0};
         int base_hits{0};
@@ -5368,12 +5372,18 @@ namespace
         int server_batch_failures{0};
         int server_batch_calls{0};
         int server_strokes_sent{0};
-        int server_batch_limit{50};
+        int server_batch_limit{0};
+        int server_batch_delay_ms{0};
         int commit_pulses{0};
         int progress_percent{-1};
         double template_point_elapsed_ms{0.0};
         double template_capture_elapsed_ms{0.0};
         double server_batch_elapsed_ms{0.0};
+        double base_probe_spacing_px{0.0};
+        double coverage_brush_screen_radius_px{0.0};
+        double coverage_sample_spacing_px{0.0};
+        double coverage_candidate_spacing_px{0.0};
+        double coverage_estimated_acceptance{0.0};
         double bbox_min_nx{1.0};
         double bbox_min_ny{1.0};
         double bbox_max_nx{0.0};
@@ -5403,6 +5413,8 @@ namespace
         std::vector<std::uint8_t> uv_bins{};
         std::chrono::steady_clock::time_point started{};
         std::chrono::steady_clock::time_point server_batch_started{};
+        std::chrono::steady_clock::time_point server_next_batch_time{};
+        UINT_PTR server_batch_timer_id{0};
         std::chrono::steady_clock::time_point last_tick{};
     };
 
@@ -5435,7 +5447,7 @@ namespace
                                    double u,
                                    double v) -> bool
     {
-        if (!job || static_cast<int>(job->points.size()) >= job->point_target)
+        if (!job)
         {
             return false;
         }
@@ -5510,6 +5522,7 @@ namespace
         const double min_ny = clamp01(job->bbox_min_ny);
         const double max_ny = clamp01(job->bbox_max_ny);
         const double span_ny = std::max(0.001, max_ny - min_ny);
+        const double span_height_px = std::max(1.0, span_ny * static_cast<double>(job->viewport_height));
 
         auto nearest_base_row = [&](double ny) -> int {
             const double normalized = clamp01((ny - 0.02) / 0.96);
@@ -5534,37 +5547,78 @@ namespace
             return best;
         };
 
-        const double row_height_px = span_ny * static_cast<double>(job->viewport_height) / static_cast<double>(std::max(1, job->dense_rows));
-        for (int row = 0; row < job->dense_rows; ++row)
+        auto build_rows = [&](int row_count, std::vector<RowInterval>& out_rows) -> double {
+            row_count = std::max(1, row_count);
+            out_rows.assign(static_cast<std::size_t>(row_count), RowInterval{});
+            double area_px = 0.0;
+            const double row_height_px = span_height_px / static_cast<double>(row_count);
+            for (int row = 0; row < row_count; ++row)
+            {
+                const double ty = (static_cast<double>(row) + 0.5) / static_cast<double>(row_count);
+                const double ny = min_ny + span_ny * ty;
+                const int base_row = nearest_base_row(ny);
+                if (base_row < 0)
+                {
+                    continue;
+                }
+                const int min_ix = std::max(0, job->silhouette_min_ix[static_cast<std::size_t>(base_row)] - 1);
+                const int max_ix = std::min(job->base_cols - 1, job->silhouette_max_ix[static_cast<std::size_t>(base_row)] + 1);
+                if (min_ix > max_ix)
+                {
+                    continue;
+                }
+                const double min_nx = clamp01(0.06 + (static_cast<double>(min_ix) / static_cast<double>(job->base_cols)) * 0.88);
+                const double max_nx = clamp01(0.06 + (static_cast<double>(max_ix + 1) / static_cast<double>(job->base_cols)) * 0.88);
+                if (max_nx <= min_nx)
+                {
+                    continue;
+                }
+                out_rows[static_cast<std::size_t>(row)] = RowInterval{min_nx, max_nx, true};
+                area_px += (max_nx - min_nx) * static_cast<double>(job->viewport_width) * row_height_px;
+            }
+            return area_px;
+        };
+
+        const int probe_rows = std::max(1, job->base_rows * 2);
+        job->silhouette_area_px = build_rows(probe_rows, rows);
+        if (job->silhouette_area_px <= 0.0)
         {
-            const double ty = (static_cast<double>(row) + 0.5) / static_cast<double>(std::max(1, job->dense_rows));
-            const double ny = min_ny + span_ny * ty;
-            const int base_row = nearest_base_row(ny);
-            if (base_row < 0)
-            {
-                continue;
-            }
-            const int min_ix = std::max(0, job->silhouette_min_ix[static_cast<std::size_t>(base_row)] - 1);
-            const int max_ix = std::min(job->base_cols - 1, job->silhouette_max_ix[static_cast<std::size_t>(base_row)] + 1);
-            if (min_ix > max_ix)
-            {
-                continue;
-            }
-            const double min_nx = clamp01(0.06 + (static_cast<double>(min_ix) / static_cast<double>(job->base_cols)) * 0.88);
-            const double max_nx = clamp01(0.06 + (static_cast<double>(max_ix + 1) / static_cast<double>(job->base_cols)) * 0.88);
-            if (max_nx <= min_nx)
-            {
-                continue;
-            }
-            rows[static_cast<std::size_t>(row)] = RowInterval{min_nx, max_nx, true};
-            job->silhouette_area_px += (max_nx - min_nx) * static_cast<double>(job->viewport_width) * row_height_px;
+            return;
         }
 
-        const int hard_cap = std::max(1, job->point_target);
-        const int dynamic_target = std::max(1, std::min(hard_cap, static_cast<int>(std::ceil(job->silhouette_area_px / 9.0))));
-        const double spacing_px = std::max(1.0, std::sqrt(std::max(1.0, job->silhouette_area_px) / static_cast<double>(dynamic_target)));
+        const double brush_radius = std::max(0.0001, job->brush_radius);
+        const double viewport_short_px = static_cast<double>(std::max(1, std::min(job->viewport_width, job->viewport_height)));
+        job->coverage_brush_screen_radius_px = std::max(1.0, viewport_short_px * brush_radius);
+        job->coverage_sample_spacing_px = std::max(1.0, job->coverage_brush_screen_radius_px * 0.25);
+        job->coverage_sample_target = std::max(
+            1,
+            static_cast<int>(std::ceil(job->silhouette_area_px /
+                                       std::max(1.0, job->coverage_sample_spacing_px * job->coverage_sample_spacing_px))));
+        const double base_acceptance = job->base_attempts > 0
+                                           ? static_cast<double>(job->base_hits) / static_cast<double>(job->base_attempts)
+                                           : 0.0;
+        job->coverage_estimated_acceptance = std::max(0.18, std::min(0.78, base_acceptance * 16.0));
+        job->coverage_candidate_target = std::max(
+            job->coverage_sample_target,
+            static_cast<int>(std::ceil(static_cast<double>(job->coverage_sample_target) /
+                                       std::max(0.01, job->coverage_estimated_acceptance))));
+        job->coverage_candidate_spacing_px = std::max(
+            1.0,
+            std::sqrt(job->silhouette_area_px / static_cast<double>(std::max(1, job->coverage_candidate_target))));
+        job->point_target = job->coverage_sample_target;
+        job->dense_rows = std::max(
+            1,
+            std::min(job->viewport_height,
+                     static_cast<int>(std::ceil(span_height_px / job->coverage_candidate_spacing_px))));
+        job->silhouette_area_px = build_rows(job->dense_rows, rows);
+        if (job->silhouette_area_px <= 0.0)
+        {
+            return;
+        }
+        job->points.reserve(static_cast<std::size_t>(std::max(job->point_target, static_cast<int>(job->points.size()))));
+
         std::vector<TemplateUvBrushAsyncJob::ScreenCandidate> candidates{};
-        candidates.reserve(static_cast<std::size_t>(dynamic_target));
+        candidates.reserve(static_cast<std::size_t>(std::max(1, job->coverage_candidate_target)));
         for (int row = 0; row < job->dense_rows; ++row)
         {
             const auto& interval = rows[static_cast<std::size_t>(row)];
@@ -5575,7 +5629,7 @@ namespace
             const double ty = (static_cast<double>(row) + 0.5) / static_cast<double>(std::max(1, job->dense_rows));
             const double ny = min_ny + span_ny * ty;
             const double width_px = std::max(1.0, (interval.max_nx - interval.min_nx) * static_cast<double>(job->viewport_width));
-            const int cols = std::max(1, static_cast<int>(std::ceil(width_px / spacing_px)));
+            const int cols = std::max(1, static_cast<int>(std::ceil(width_px / job->coverage_candidate_spacing_px)));
             for (int col = 0; col < cols; ++col)
             {
                 const double tx = (static_cast<double>(col) + 0.5) / static_cast<double>(cols);
@@ -5583,12 +5637,12 @@ namespace
             }
         }
 
-        if (static_cast<int>(candidates.size()) > hard_cap)
+        if (static_cast<int>(candidates.size()) > job->coverage_candidate_target)
         {
-            job->dense_candidates.reserve(static_cast<std::size_t>(hard_cap));
-            for (int i = 0; i < hard_cap; ++i)
+            job->dense_candidates.reserve(static_cast<std::size_t>(job->coverage_candidate_target));
+            for (int i = 0; i < job->coverage_candidate_target; ++i)
             {
-                const std::size_t index = static_cast<std::size_t>((static_cast<unsigned long long>(i) * static_cast<unsigned long long>(candidates.size())) / static_cast<unsigned long long>(hard_cap));
+                const std::size_t index = static_cast<std::size_t>((static_cast<unsigned long long>(i) * static_cast<unsigned long long>(candidates.size())) / static_cast<unsigned long long>(job->coverage_candidate_target));
                 job->dense_candidates.push_back(candidates[std::min(index, candidates.size() - 1)]);
             }
         }
@@ -5597,6 +5651,51 @@ namespace
             job->dense_candidates.swap(candidates);
         }
         job->candidate_count = static_cast<int>(job->dense_candidates.size());
+    }
+
+    auto template_downsample_points_to_target(const std::shared_ptr<TemplateUvBrushAsyncJob>& job) -> void
+    {
+        if (!job)
+        {
+            return;
+        }
+        job->points_before_downsample = static_cast<int>(job->points.size());
+        job->downsample_removed = 0;
+        if (job->point_target <= 0 || static_cast<int>(job->points.size()) <= job->point_target)
+        {
+            return;
+        }
+
+        std::sort(job->points.begin(), job->points.end(), [](const auto& a, const auto& b) {
+            if (a.y == b.y) return a.x < b.x;
+            return a.y < b.y;
+        });
+
+        std::vector<TemplateUvBrushAsyncJob::TemplatePoint> selected{};
+        selected.reserve(static_cast<std::size_t>(job->point_target));
+        const auto source_count = job->points.size();
+        for (int i = 0; i < job->point_target; ++i)
+        {
+            const auto index = static_cast<std::size_t>(
+                std::min<double>(
+                    static_cast<double>(source_count - 1),
+                    std::floor(((static_cast<double>(i) + 0.5) * static_cast<double>(source_count)) /
+                               static_cast<double>(job->point_target))));
+            selected.push_back(job->points[index]);
+        }
+        job->downsample_removed = static_cast<int>(source_count - selected.size());
+        job->points.swap(selected);
+    }
+
+    auto template_configure_server_batch_stream(const std::shared_ptr<TemplateUvBrushAsyncJob>& job, int total_points) -> void
+    {
+        if (!job)
+        {
+            return;
+        }
+        const double root = std::sqrt(static_cast<double>(std::max(1, total_points)));
+        job->server_batch_limit = std::max(1, static_cast<int>(std::ceil(root * 0.42)));
+        job->server_batch_delay_ms = std::max(1, static_cast<int>(std::ceil(1000.0 / root)));
     }
 
     auto start_template_uv_brush_async_job(const std::string& request, const std::shared_ptr<QueuedPaintJob>& queued_job) -> bool
@@ -5660,7 +5759,8 @@ namespace
         metadata += ",\"live_set_hidden_in_game_used\":false";
         metadata += ",\"scene_capture_basecolor_required\":true";
         metadata += ",\"template_min_direct_points\":0";
-        metadata += ",\"template_color_sample_hard_cap\":60000";
+        metadata += ",\"template_sample_count_fixed\":false";
+        metadata += ",\"template_sample_target_mode\":\"brush_coverage_dynamic\"";
         metadata += ",\"template_paint_target_channel\":\"Albedo\"";
         metadata += ",\"template_material_channel_overwrite\":false";
         metadata += ",\"template_material_source\":\"preserve_existing_material_channels\"";
@@ -5749,21 +5849,29 @@ namespace
         job->brush = job->old_brush;
         job->brush.Hardness = 1.0f;
         job->brush.Opacity = 1.0f;
+        job->brush_radius_raw = 0.02;
+        job->brush_radius = 0.02;
+        job->brush.Radius = static_cast<float>(job->brush_radius);
+        const double visible_probe_width_px = std::max(1.0, static_cast<double>(job->viewport_width) * 0.88);
+        const double visible_probe_height_px = std::max(1.0, static_cast<double>(job->viewport_height) * 0.96);
+        job->base_probe_spacing_px = std::max(
+            1.0,
+            std::sqrt(visible_probe_width_px * visible_probe_height_px) * job->brush_radius * 0.75);
+        job->base_cols = std::max(1, static_cast<int>(std::ceil(visible_probe_width_px / job->base_probe_spacing_px)));
+        job->base_rows = std::max(1, static_cast<int>(std::ceil(visible_probe_height_px / job->base_probe_spacing_px)));
         job->brush.Spacing = 0.18f;
         job->brush.Falloff = meccha_sdk::EBrushFalloff::Spherical;
         job->brush.BlendMode = meccha_sdk::EPaintBlendMode::Normal;
-        job->server_batch_limit = 50;
         job->metadata = metadata;
         job->metadata += ",\"template_base_cols\":" + std::to_string(job->base_cols);
         job->metadata += ",\"template_base_rows\":" + std::to_string(job->base_rows);
-        job->metadata += ",\"template_candidate_rows\":" + std::to_string(job->dense_rows);
-        job->metadata += ",\"template_point_hard_cap\":" + std::to_string(job->point_target);
+        job->metadata += ",\"template_base_probe_spacing_px\":" + std::to_string(job->base_probe_spacing_px);
+        job->metadata += ",\"template_base_probe_formula\":\"ceil(visible_probe_extent/(sqrt(visible_probe_area)*brush_radius*0.75))\"";
         job->metadata += ",\"template_explicit_stroke_batch_enabled\":true";
-        job->metadata += ",\"template_explicit_stroke_batch_limit\":" + std::to_string(job->server_batch_limit);
+        job->metadata += ",\"template_explicit_stroke_batch_mode\":\"sqrt_dynamic_timer_drained\"";
         job->metadata += ",\"template_dense_order\":\"front_silhouette_interval_top_down\"";
         job->started = std::chrono::steady_clock::now();
         job->last_tick = job->started;
-        job->points.reserve(static_cast<std::size_t>(job->point_target));
 
         {
             std::lock_guard<std::mutex> lock(g_template_uv_brush_mutex);
@@ -5794,13 +5902,37 @@ namespace
             return;
         }
 
-        auto post_next = []() {
+        auto clear_server_timer = [&]() {
+            if (job->server_batch_timer_id)
+            {
+                KillTimer(nullptr, job->server_batch_timer_id);
+                job->server_batch_timer_id = 0;
+            }
+        };
+        clear_server_timer();
+        auto post_next_after = [&](int delay_ms) {
             if (const auto thread_id = g_game_thread_id.load())
             {
+                if (delay_ms <= 0)
+                {
+                    PostThreadMessageW(thread_id, PaintDispatchMessage, 0, 0);
+                    return;
+                }
+                const auto timer_id = SetTimer(nullptr, 0, static_cast<UINT>(std::max(1, delay_ms)), nullptr);
+                if (timer_id)
+                {
+                    job->server_batch_timer_id = timer_id;
+                    return;
+                }
                 PostThreadMessageW(thread_id, PaintDispatchMessage, 0, 0);
             }
         };
-        auto cleanup_state = []() {};
+        auto post_next = [&]() {
+            post_next_after(0);
+        };
+        auto cleanup_state = [&]() {
+            clear_server_timer();
+        };
         auto fail_job = [&](const char* stage, const std::string& message) {
             cleanup_state();
             complete_template_uv_brush_job(job,
@@ -5922,7 +6054,7 @@ namespace
             constexpr int chunk = 768;
             const int total = static_cast<int>(job->dense_candidates.size());
             const int end = std::min(total, job->next_index + chunk);
-            for (; job->next_index < end && static_cast<int>(job->points.size()) < job->point_target; ++job->next_index)
+            for (; job->next_index < end; ++job->next_index)
             {
                 const auto& candidate = job->dense_candidates[static_cast<std::size_t>(job->next_index)];
                 ++job->dense_attempts;
@@ -5947,10 +6079,11 @@ namespace
                                           ",\"dense_attempts\":" + std::to_string(job->dense_attempts) +
                                           ",\"dense_candidates\":" + std::to_string(job->candidate_count));
             }
-            if (job->next_index >= total || static_cast<int>(job->points.size()) >= job->point_target)
+            if (job->next_index >= total)
             {
                 job->sampler_probe_attempts = job->base_attempts + job->dense_attempts;
                 job->sampler_probe_misses = std::max(0, job->sampler_probe_attempts - job->base_hits - job->dense_hits);
+                template_downsample_points_to_target(job);
                 job->template_point_elapsed_ms = job_elapsed_ms();
                 job->progress_percent = -1;
                 std::sort(job->points.begin(), job->points.end(), [](const auto& a, const auto& b) {
@@ -5964,6 +6097,8 @@ namespace
                                       100,
                                       job_elapsed_ms(),
                                       "\"points\":" + std::to_string(job->points.size()) +
+                                          ",\"points_before_downsample\":" + std::to_string(job->points_before_downsample) +
+                                          ",\"downsample_removed\":" + std::to_string(job->downsample_removed) +
                                           ",\"sampler_probe_attempts\":" + std::to_string(job->sampler_probe_attempts) +
                                           ",\"sampler_probe_misses\":" + std::to_string(job->sampler_probe_misses));
                 job->progress_percent = -1;
@@ -6128,6 +6263,7 @@ namespace
             job->brush_radius = radius;
             job->brush.Radius = static_cast<float>(radius);
             job->brush.Spacing = 0.08f;
+            template_configure_server_batch_stream(job, template_count);
             job->server_batch_started = std::chrono::steady_clock::now();
             write_bridge_progress("template_server_batch_begin",
                                   "template server batch stream prepared",
@@ -6146,7 +6282,10 @@ namespace
                                       ",\"brush_radius_raw\":" + std::to_string(job->brush_radius_raw) +
                                       ",\"brush_radius\":" + std::to_string(job->brush_radius) +
                                       ",\"server_rpc\":\"ServerPaintBatch\"" +
-                                      ",\"server_batch_limit\":" + std::to_string(job->server_batch_limit));
+                                      ",\"server_batch_limit\":" + std::to_string(job->server_batch_limit) +
+                                      ",\"server_batch_limit_formula\":\"ceil(sqrt(paint_samples)*0.42)\"" +
+                                      ",\"server_batch_delay_ms\":" + std::to_string(job->server_batch_delay_ms) +
+                                      ",\"server_batch_delay_formula\":\"ceil(1000/sqrt(paint_samples))\"");
             job->replicate_index = 0;
             job->phase = TemplateUvBrushAsyncJob::Phase::ReplicateStrokes;
             post_next();
@@ -6167,6 +6306,19 @@ namespace
                 post_next();
                 return;
             }
+
+            const auto now = std::chrono::steady_clock::now();
+            if (job->server_next_batch_time.time_since_epoch().count() != 0 &&
+                now < job->server_next_batch_time)
+            {
+                const int remaining_ms = std::max(
+                    1,
+                    static_cast<int>(std::ceil(std::chrono::duration<double, std::milli>(
+                        job->server_next_batch_time - now).count())));
+                post_next_after(remaining_ms);
+                return;
+            }
+            job->server_next_batch_time = {};
 
             const int count = std::max(1, std::min(job->server_batch_limit, total_points - job->replicate_index));
             std::vector<meccha_sdk::FPaintStroke> strokes{};
@@ -6218,6 +6370,8 @@ namespace
             ++job->server_batch_calls;
             job->server_strokes_sent += count;
             job->replicate_index += count;
+            job->server_next_batch_time = std::chrono::steady_clock::now() +
+                                          std::chrono::milliseconds(std::max(1, job->server_batch_delay_ms));
 
             const int percent = 98 + static_cast<int>((static_cast<long long>(job->replicate_index) * 1LL) / std::max(1, total_points));
             if (percent != job->progress_percent)
@@ -6232,9 +6386,10 @@ namespace
                                           ",\"points\":" + std::to_string(job->points.size()) +
                                           ",\"server_batch_calls\":" + std::to_string(job->server_batch_calls) +
                                           ",\"server_batch_rpc\":\"" + json_escape(job->server_batch_rpc) + "\"" +
-                                          ",\"server_batch_limit\":" + std::to_string(job->server_batch_limit));
+                                          ",\"server_batch_limit\":" + std::to_string(job->server_batch_limit) +
+                                          ",\"server_batch_delay_ms\":" + std::to_string(job->server_batch_delay_ms));
             }
-            post_next();
+            post_next_after(job->server_batch_delay_ms);
             return;
         }
         case TemplateUvBrushAsyncJob::Phase::Finish:
@@ -6246,12 +6401,24 @@ namespace
             std::string metadata = job->metadata;
             metadata += ",\"template_artifacts_written\":false";
             metadata += ",\"color_source\":\"" + json_escape(job->color_source) + "\"";
+            metadata += ",\"template_base_probe_spacing_px\":" + std::to_string(job->base_probe_spacing_px);
             metadata += ",\"phase0_base_hits\":" + std::to_string(job->base_hits);
             metadata += ",\"phase0_base_attempts\":" + std::to_string(job->base_attempts);
             metadata += ",\"phase0_dense_hits\":" + std::to_string(job->dense_hits);
             metadata += ",\"phase0_dense_attempts\":" + std::to_string(job->dense_attempts);
+            metadata += ",\"template_candidate_rows\":" + std::to_string(job->dense_rows);
             metadata += ",\"dense_candidate_count\":" + std::to_string(job->candidate_count);
             metadata += ",\"silhouette_area_px\":" + std::to_string(job->silhouette_area_px);
+            metadata += ",\"template_sample_count_fixed\":false";
+            metadata += ",\"template_sample_target_mode\":\"brush_coverage_dynamic\"";
+            metadata += ",\"template_sample_target_formula\":\"ceil(silhouette_area_px / pow(min(viewport_width,viewport_height)*brush_radius*0.25,2))\"";
+            metadata += ",\"template_sample_target\":" + std::to_string(job->coverage_sample_target);
+            metadata += ",\"template_candidate_target_formula\":\"ceil(template_sample_target / estimated_dense_acceptance)\"";
+            metadata += ",\"template_candidate_target\":" + std::to_string(job->coverage_candidate_target);
+            metadata += ",\"template_brush_screen_radius_px\":" + std::to_string(job->coverage_brush_screen_radius_px);
+            metadata += ",\"template_sample_spacing_px\":" + std::to_string(job->coverage_sample_spacing_px);
+            metadata += ",\"template_candidate_spacing_px\":" + std::to_string(job->coverage_candidate_spacing_px);
+            metadata += ",\"template_estimated_dense_acceptance\":" + std::to_string(job->coverage_estimated_acceptance);
             metadata += ",\"sampler_probe_attempts\":" + std::to_string(job->sampler_probe_attempts);
             metadata += ",\"sampler_probe_misses\":" + std::to_string(job->sampler_probe_misses);
             metadata += ",\"runtime_hit_test_attempts\":" + std::to_string(job->runtime_hit_test_attempts);
@@ -6263,8 +6430,12 @@ namespace
             metadata += ",\"template_clone_strategy\":\"disabled\"";
             metadata += ",\"phase0_lower_rescan_used\":false";
             metadata += ",\"template_points\":" + std::to_string(job->points.size());
-            metadata += ",\"template_color_sample_hard_cap\":" + std::to_string(job->point_target);
-            metadata += std::string(",\"template_dense_early_stopped\":false");
+            metadata += ",\"template_points_before_downsample\":" + std::to_string(job->points_before_downsample);
+            metadata += ",\"template_downsample_removed\":" + std::to_string(job->downsample_removed);
+            metadata += ",\"template_downsample_strategy\":\"uniform_yx_after_full_candidate_scan\"";
+            metadata += ",\"template_color_sample_target\":" + std::to_string(job->point_target);
+            metadata += std::string(",\"template_dense_early_stopped\":") +
+                        json_bool(job->next_index < job->candidate_count);
             metadata += ",\"paint_samples\":" + std::to_string(job->paint_sample_success);
             metadata += ",\"paint_sample_attempts\":" + std::to_string(job->paint_sample_attempts);
             metadata += ",\"paint_sample_success\":" + std::to_string(job->paint_sample_success);
@@ -6294,6 +6465,10 @@ namespace
             metadata += ",\"server_paint_batch_used\":true";
             metadata += ",\"server_batch_rpc\":\"" + json_escape(job->server_batch_rpc) + "\"";
             metadata += ",\"server_batch_limit\":" + std::to_string(job->server_batch_limit);
+            metadata += ",\"server_batch_limit_formula\":\"ceil(sqrt(paint_samples)*0.42)\"";
+            metadata += ",\"server_batch_delay_ms\":" + std::to_string(job->server_batch_delay_ms);
+            metadata += ",\"server_batch_delay_formula\":\"ceil(1000/sqrt(paint_samples))\"";
+            metadata += ",\"server_batch_schedule\":\"timer_drained\"";
             metadata += ",\"server_batch_calls\":" + std::to_string(job->server_batch_calls);
             metadata += ",\"server_batch_success\":" + std::to_string(job->server_batch_success);
             metadata += ",\"server_batch_failures\":" + std::to_string(job->server_batch_failures);
