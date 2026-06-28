@@ -3103,7 +3103,7 @@ namespace
         return out;
     }
 
-    auto sdk_candidate_matches_profile(Reflection& ref, const SdkFrontMeshCandidate& candidate) -> bool
+    auto sdk_candidate_is_usable_paint_mesh(Reflection& ref, const SdkFrontMeshCandidate& candidate) -> bool
     {
         const auto text = lower_copy(ref.object_name(candidate.mesh) + " " +
                                      ref.class_name(candidate.mesh) + " " +
@@ -3111,7 +3111,8 @@ namespace
                                      ref.object_name(candidate.asset) + " " +
                                      ref.class_name(candidate.asset) + " " +
                                      ref.object_path(candidate.asset));
-        return contains_text(text, "paintman");
+        return contains_text(text, "mesh") &&
+               (live_uobject(candidate.asset) || candidate.source == "runtime_paint_get_initialized_paint_mesh");
     }
 
     auto sdk_select_profile_mesh_candidate(Reflection& ref,
@@ -3120,7 +3121,16 @@ namespace
     {
         for (const auto& candidate : candidates)
         {
-            if (sdk_candidate_matches_profile(ref, candidate))
+            if (candidate.source == "runtime_paint_get_initialized_paint_mesh" &&
+                sdk_candidate_is_usable_paint_mesh(ref, candidate))
+            {
+                out = candidate;
+                return true;
+            }
+        }
+        for (const auto& candidate : candidates)
+        {
+            if (sdk_candidate_is_usable_paint_mesh(ref, candidate))
             {
                 out = candidate;
                 return true;
@@ -3936,6 +3946,18 @@ namespace
         return text;
     }
 
+    auto mesh_first_strip_object_suffix(std::string text) -> std::string
+    {
+        const auto slash = text.find_last_of('/');
+        const auto dot = text.find_last_of('.');
+        if (dot != std::string::npos &&
+            (slash == std::string::npos || dot > slash))
+        {
+            text.resize(dot);
+        }
+        return text;
+    }
+
     auto mesh_first_profile_candidate_score(Reflection& ref,
                                             const MeshFirstProfile& profile,
                                             const SdkFrontMeshCandidate& candidate) -> int
@@ -3944,27 +3966,20 @@ namespace
         {
             return 0;
         }
-        const auto candidate_text = lower_copy(ref.object_name(candidate.mesh) + " " +
-                                               ref.class_name(candidate.mesh) + " " +
-                                               ref.object_path(candidate.mesh) + " " +
-                                               ref.object_name(candidate.asset) + " " +
-                                               ref.class_name(candidate.asset) + " " +
-                                               ref.object_path(candidate.asset));
         const auto profile_path = mesh_first_normalize_asset_identity(profile.source_path);
         const auto export_name = lower_copy(profile.export_name);
+        const auto candidate_asset_name = lower_copy(ref.object_name(candidate.asset));
+        const auto candidate_asset_path = mesh_first_normalize_asset_identity(ref.object_path(candidate.asset));
+        const auto candidate_asset_package = mesh_first_strip_object_suffix(candidate_asset_path);
         int score = 0;
-        if (!profile_path.empty() && contains_text(candidate_text, profile_path.c_str()))
+        if (!profile_path.empty() &&
+            (candidate_asset_package == profile_path || candidate_asset_path == profile_path))
         {
             score += 1000;
         }
-        if (!export_name.empty() && contains_text(candidate_text, export_name.c_str()))
+        if (!export_name.empty() && candidate_asset_name == export_name)
         {
             score += 100;
-        }
-        if (contains_text(candidate_text, "paintman") &&
-            contains_text(lower_copy(profile.profile_id + " " + profile.source_path + " " + profile.export_name), "paintman"))
-        {
-            score += 10;
         }
         return score;
     }
@@ -4820,6 +4835,47 @@ namespace
                value.Y >= -0.05 && value.Y <= 1.05;
     }
 
+    auto mesh_first_region_axis_from_runtime_triangles(const std::vector<MeshFirstRuntimeTriangle>& triangles) -> char
+    {
+        bool initialized = false;
+        double min_x = 0.0;
+        double max_x = 0.0;
+        double min_y = 0.0;
+        double max_y = 0.0;
+        for (const auto& triangle : triangles)
+        {
+            for (const auto& local : triangle.local)
+            {
+                if (!mesh_first_finite_vector(local))
+                {
+                    continue;
+                }
+                if (!initialized)
+                {
+                    min_x = max_x = local.X;
+                    min_y = max_y = local.Y;
+                    initialized = true;
+                    continue;
+                }
+                min_x = std::min(min_x, local.X);
+                max_x = std::max(max_x, local.X);
+                min_y = std::min(min_y, local.Y);
+                max_y = std::max(max_y, local.Y);
+            }
+        }
+        if (!initialized)
+        {
+            return 'x';
+        }
+        const double range_x = max_x - min_x;
+        const double range_y = max_y - min_y;
+        if (std::isfinite(range_x) && std::isfinite(range_y) && range_y > 0.001 && range_y < range_x)
+        {
+            return 'y';
+        }
+        return 'x';
+    }
+
     auto mesh_first_read_runtime_triangle(std::uintptr_t base, MeshFirstRuntimeTriangle& out) -> bool
     {
         for (int i = 0; i < 3; ++i)
@@ -4965,6 +5021,114 @@ namespace
         out.stride = kStride;
         out.triangle_count = static_cast<int>(best_triangles.size());
         out.profile_uv_avg_error = best_error;
+        out.triangles = std::move(best_triangles);
+        return out;
+    }
+
+    auto mesh_first_resolve_runtime_triangle_cache_dynamic(std::uintptr_t component) -> MeshFirstRuntimeTriangleCache
+    {
+        MeshFirstRuntimeTriangleCache out{};
+        if (!component)
+        {
+            out.failure = "runtime_triangle_cache_invalid_component";
+            return out;
+        }
+
+        constexpr int kStride = 208;
+        int best_score = 0;
+        int best_offset = -1;
+        std::uintptr_t best_data = 0;
+        int best_count = 0;
+        std::vector<MeshFirstRuntimeTriangle> best_triangles{};
+
+        for (int offset = 0; offset + 16 <= 0x3000; offset += 8)
+        {
+            const auto data = safe_read<std::uintptr_t>(component + static_cast<std::uintptr_t>(offset), 0);
+            const auto num = safe_read<int>(component + static_cast<std::uintptr_t>(offset + 8), 0);
+            const auto max = safe_read<int>(component + static_cast<std::uintptr_t>(offset + 12), 0);
+            if (!data || num <= 0 || num > 200000 || max < num || max > num + std::max(1024, num / 2))
+            {
+                continue;
+            }
+
+            const int check_count = std::min(num, 96);
+            bool valid = true;
+            double uv_area_sum = 0.0;
+            double world_area_sum = 0.0;
+            for (int i = 0; i < check_count; ++i)
+            {
+                MeshFirstRuntimeTriangle triangle{};
+                if (!mesh_first_read_runtime_triangle(data + static_cast<std::uintptr_t>(i) * kStride, triangle))
+                {
+                    valid = false;
+                    break;
+                }
+                const double uv_area = mesh_first_uv_triangle_area(triangle.uv[0].X,
+                                                                   triangle.uv[0].Y,
+                                                                   triangle.uv[1].X,
+                                                                   triangle.uv[1].Y,
+                                                                   triangle.uv[2].X,
+                                                                   triangle.uv[2].Y);
+                const auto edge0 = sdk_vec_sub(triangle.world[1], triangle.world[0]);
+                const auto edge1 = sdk_vec_sub(triangle.world[2], triangle.world[0]);
+                const double world_area = sdk_vec_len(sdk_vec_cross(edge0, edge1)) * 0.5;
+                if (!std::isfinite(uv_area) || uv_area <= 0.0 ||
+                    !std::isfinite(world_area) || world_area <= 0.000001)
+                {
+                    valid = false;
+                    break;
+                }
+                uv_area_sum += uv_area;
+                world_area_sum += world_area;
+            }
+            if (!valid)
+            {
+                continue;
+            }
+
+            const int score = check_count * 100000 + std::min(num, 99999);
+            if (score <= best_score)
+            {
+                continue;
+            }
+
+            std::vector<MeshFirstRuntimeTriangle> triangles{};
+            triangles.resize(static_cast<std::size_t>(num));
+            for (int i = 0; i < num; ++i)
+            {
+                MeshFirstRuntimeTriangle triangle{};
+                if (!mesh_first_read_runtime_triangle(data + static_cast<std::uintptr_t>(i) * kStride, triangle))
+                {
+                    valid = false;
+                    break;
+                }
+                triangles[static_cast<std::size_t>(i)] = triangle;
+            }
+            if (!valid)
+            {
+                continue;
+            }
+
+            best_score = score + static_cast<int>(std::min(9999.0, uv_area_sum * 1000000.0 + world_area_sum));
+            best_offset = offset;
+            best_data = data;
+            best_count = num;
+            best_triangles = std::move(triangles);
+        }
+
+        if (best_offset < 0 || best_triangles.empty())
+        {
+            out.failure = "runtime_triangle_cache_unavailable";
+            return out;
+        }
+
+        out.ok = true;
+        out.failure.clear();
+        out.owner_offset = best_offset;
+        out.data = best_data;
+        out.stride = kStride;
+        out.triangle_count = best_count;
+        out.profile_uv_avg_error = 0.0;
         out.triangles = std::move(best_triangles);
         return out;
     }
@@ -5187,8 +5351,9 @@ namespace
         samples.push_back(sample);
     }
 
-    auto mesh_first_generate_plan_samples_from_runtime_cache(const MeshFirstProfile& profile,
+    auto mesh_first_generate_plan_samples_from_runtime_cache(const MeshFirstProfile* profile,
                                                              const std::vector<MeshFirstRuntimeTriangle>& triangles,
+                                                             int texture_size,
                                                              const sdk::FVector& camera_location,
                                                              const sdk::FVector& camera_direction,
                                                              char region_axis,
@@ -5204,25 +5369,29 @@ namespace
 
         samples.clear();
         stats = {};
-        const int expected_triangles = profile.index_count / 3;
+        const int expected_triangles = profile ? profile->index_count / 3 : static_cast<int>(triangles.size());
         if (expected_triangles <= 0 ||
-            static_cast<int>(profile.indices.size()) < profile.index_count ||
-            static_cast<int>(profile.triangles.size()) != expected_triangles ||
             static_cast<int>(triangles.size()) != expected_triangles)
         {
             failure = "planner_profile_triangle_mismatch";
             return false;
         }
-        const double texture_size = static_cast<double>(std::max(1, profile.texture_size));
-        const double step_uv = clamp_range(coverage_step_texels, 1.0, 64.0) / texture_size;
+        if (profile &&
+            (static_cast<int>(profile->indices.size()) < profile->index_count ||
+             static_cast<int>(profile->triangles.size()) != expected_triangles))
+        {
+            failure = "planner_profile_triangle_mismatch";
+            return false;
+        }
+        const double texture_size_double = static_cast<double>(std::max(1, texture_size));
+        const double step_uv = clamp_range(coverage_step_texels, 1.0, 64.0) / texture_size_double;
         samples.reserve(std::min<std::size_t>(static_cast<std::size_t>(std::max(1, max_strokes)) + 1, 100000));
 
         for (std::size_t tri = 0; tri < static_cast<std::size_t>(expected_triangles); ++tri)
         {
             const auto& triangle = triangles[tri];
-            const auto& meta = profile.triangles[tri];
             const std::size_t index_base = tri * 3;
-            if (index_base + 2 >= profile.indices.size())
+            if (profile && index_base + 2 >= profile->indices.size())
             {
                 ++stats.invalid_triangles;
                 continue;
@@ -5230,9 +5399,16 @@ namespace
             bool valid_indices = true;
             for (int vertex_slot = 0; vertex_slot < 3; ++vertex_slot)
             {
-                const int vertex_index = profile.indices[index_base + static_cast<std::size_t>(vertex_slot)];
-                if (vertex_index < 0 || vertex_index >= profile.vertex_count ||
-                    !mesh_first_finite_vector(triangle.world[vertex_slot]) ||
+                if (profile)
+                {
+                    const int vertex_index = profile->indices[index_base + static_cast<std::size_t>(vertex_slot)];
+                    if (vertex_index < 0 || vertex_index >= profile->vertex_count)
+                    {
+                        valid_indices = false;
+                        continue;
+                    }
+                }
+                if (!mesh_first_finite_vector(triangle.world[vertex_slot]) ||
                     !mesh_first_finite_vector(triangle.local[vertex_slot]) ||
                     !mesh_first_finite_uv(triangle.uv[vertex_slot]))
                 {
@@ -5249,7 +5425,7 @@ namespace
                                                                       sdk_vec_sub(triangle.world[2], triangle.world[0])));
             const auto runtime_local_normal = sdk_vec_normalize(sdk_vec_cross(sdk_vec_sub(triangle.local[1], triangle.local[0]),
                                                                               sdk_vec_sub(triangle.local[2], triangle.local[0])));
-            auto region_normal = sdk_vec_normalize(meta.local_normal);
+            auto region_normal = profile ? sdk_vec_normalize(profile->triangles[tri].local_normal) : runtime_local_normal;
             if (sdk_vec_len(region_normal) <= 0.000001)
             {
                 region_normal = runtime_local_normal;
@@ -5284,6 +5460,13 @@ namespace
                                                               triangle.uv[1].Y,
                                                               triangle.uv[2].X,
                                                               triangle.uv[2].Y);
+            MeshFirstProfile::TriangleMeta runtime_meta{};
+            runtime_meta.uv_island = -1;
+            runtime_meta.dominant_bone = -1;
+            runtime_meta.body_region = "runtime";
+            runtime_meta.local_normal = region_normal;
+            runtime_meta.uv_area = uv_area;
+            const auto& meta = profile ? profile->triangles[tri] : runtime_meta;
             int emitted = 0;
             const double min_u = clamp01(std::min({triangle.uv[0].X, triangle.uv[1].X, triangle.uv[2].X}));
             const double max_u = clamp01(std::max({triangle.uv[0].X, triangle.uv[1].X, triangle.uv[2].X}));
@@ -6061,34 +6244,44 @@ namespace
         metadata += ",\"mesh_profile_catalog_count\":" + std::to_string(profile_catalog.size());
         MeshFirstProfile profile{};
         std::string profile_failure{};
-        if (!select_mesh_first_profile_for_candidate(ref, profile_catalog, selected_mesh, profile, profile_failure))
+        const bool profile_available = select_mesh_first_profile_for_candidate(ref, profile_catalog, selected_mesh, profile, profile_failure);
+        if (profile_available)
         {
-            return response_json(false,
-                                 profile_catalog.empty() ? "mesh_profile_missing" : "mesh_profile_identity_mismatch",
-                                 0,
-                                 1,
-                                 profile_failure.empty() ? "Mesh Profile V2 is unavailable or does not match the live mesh" : profile_failure,
-                                 metadata + ",\"mesh_identity_match\":false,\"replay_blocked\":true");
+            metadata += ",";
+            metadata += mesh_first_profile_metadata(profile);
+            metadata += ",\"mesh_identity_match\":true";
         }
-        metadata += ",";
-        metadata += mesh_first_profile_metadata(profile);
-        metadata += ",\"mesh_identity_match\":true";
-        const char region_axis = mesh_first_region_axis(profile);
-        metadata += ",\"mesh_region_axis\":\"" + std::string(mesh_first_region_axis_label(region_axis)) + "\"";
-        metadata += ",\"mesh_region_axis_selection\":\"profile_min_horizontal_extent\"";
-        metadata += ",\"mesh_region_normal_source\":\"profile_v2_triangle_local_normal\"";
+        else
+        {
+            metadata += ",\"mesh_profile_stage\":\"" + std::string(profile_catalog.empty() ? "mesh_profile_missing" : "mesh_profile_identity_mismatch") + "\"";
+            metadata += ",\"mesh_profile_ok\":false";
+            metadata += ",\"mesh_profile_failure\":\"" + json_escape(profile_failure.empty() ? "Mesh Profile V2 is unavailable or does not match the live mesh" : profile_failure) + "\"";
+            metadata += ",\"mesh_identity_match\":false";
+            metadata += ",\"runtime_dynamic_profile_required\":true";
+        }
 
         write_bridge_progress("pose_resolve",
                               "Resolving current skinned pose",
                               2,
                               4,
                               0.0,
-                              "\"pipeline\":\"mesh_first_paint\",\"mesh_profile_bone_count\":" + std::to_string(profile.bone_count));
-        auto pose = sdk_resolve_skinned_pose(ref, selected_mesh.mesh, profile.bone_count);
-        if (pose.ok && !mesh_first_validate_pose_for_profile(profile, pose))
+                              "\"pipeline\":\"mesh_first_paint\",\"mesh_profile_bone_count\":" + std::to_string(profile_available ? profile.bone_count : 0));
+        SdkPoseResolveResult pose{};
+        if (profile_available)
         {
-            pose.stage = "pose_untrusted";
-            pose.message = "current skinned pose candidate failed validation: " + pose.validation_failure;
+            pose = sdk_resolve_skinned_pose(ref, selected_mesh.mesh, profile.bone_count);
+            if (pose.ok && !mesh_first_validate_pose_for_profile(profile, pose))
+            {
+                pose.stage = "pose_untrusted";
+                pose.message = "current skinned pose candidate failed validation: " + pose.validation_failure;
+            }
+        }
+        else
+        {
+            pose.stage = "pose_skipped_profile_unavailable";
+            pose.message = "profile-free runtime triangle planning does not require skeletal pose resolution";
+            pose.source = "runtime_triangle_cache";
+            pose.validation_failure = "profile_unavailable";
         }
         metadata += ",";
         metadata += sdk_pose_result_metadata(pose);
@@ -6120,7 +6313,7 @@ namespace
         std::vector<sdk::FVector> skinned_world_positions{};
         std::string skin_failure{};
         bool skeletal_skin_available = false;
-        if (pose.ok && pose.trusted)
+        if (profile_available && pose.ok && pose.trusted)
         {
             skeletal_skin_available = mesh_first_skin_vertices(profile,
                                                                pose,
@@ -6148,8 +6341,25 @@ namespace
             metadata += ",\"pose_skinned_delta_over_10cm\":0";
         }
 
-        auto runtime_triangle_cache = mesh_first_resolve_runtime_triangle_cache(ctx.component, profile);
+        MeshFirstRuntimeTriangleCache runtime_triangle_cache{};
+        std::string runtime_triangle_cache_mode{};
+        if (profile_available)
+        {
+            runtime_triangle_cache = mesh_first_resolve_runtime_triangle_cache(ctx.component, profile);
+            runtime_triangle_cache_mode = "profile_verified";
+        }
+        if (!runtime_triangle_cache.ok)
+        {
+            const auto profile_cache_failure = runtime_triangle_cache.failure;
+            runtime_triangle_cache = mesh_first_resolve_runtime_triangle_cache_dynamic(ctx.component);
+            runtime_triangle_cache_mode = "dynamic_runtime_scan";
+            if (!profile_cache_failure.empty())
+            {
+                metadata += ",\"runtime_triangle_profile_cache_failure\":\"" + json_escape(profile_cache_failure) + "\"";
+            }
+        }
         metadata += ",\"runtime_triangle_cache_used\":" + std::string(json_bool(runtime_triangle_cache.ok));
+        metadata += ",\"runtime_triangle_cache_mode\":\"" + json_escape(runtime_triangle_cache_mode) + "\"";
         metadata += ",\"runtime_triangle_cache_offset\":\"" + (runtime_triangle_cache.owner_offset >= 0 ? hex_address(static_cast<std::uintptr_t>(runtime_triangle_cache.owner_offset)) : std::string("none")) + "\"";
         metadata += ",\"runtime_triangle_cache_stride\":" + std::to_string(runtime_triangle_cache.stride);
         metadata += ",\"runtime_triangle_cache_triangles\":" + std::to_string(runtime_triangle_cache.triangle_count);
@@ -6169,6 +6379,13 @@ namespace
                                  "RuntimePaintable cached current triangles are unavailable; mesh-first paint cannot plan safely",
                                  metadata + ",\"replay_blocked\":true");
         }
+        const int active_texture_size = profile_available ? profile.texture_size : 1024;
+        const char region_axis = profile_available ? mesh_first_region_axis(profile)
+                                                   : mesh_first_region_axis_from_runtime_triangles(runtime_triangle_cache.triangles);
+        metadata += ",\"mesh_region_axis\":\"" + std::string(mesh_first_region_axis_label(region_axis)) + "\"";
+        metadata += ",\"mesh_region_axis_selection\":\"" + std::string(profile_available ? "profile_min_horizontal_extent" : "runtime_triangle_min_horizontal_extent") + "\"";
+        metadata += ",\"mesh_region_normal_source\":\"" + std::string(profile_available ? "profile_v2_triangle_local_normal" : "runtime_triangle_local_normal") + "\"";
+        metadata += ",\"texture_size\":" + std::to_string(active_texture_size);
         auto runtime_coordinate_probe_triangles = runtime_triangle_cache.triangles;
         const auto runtime_coordinate_selection =
             mesh_first_select_runtime_triangle_coordinates(runtime_coordinate_probe_triangles, component_to_world);
@@ -6236,8 +6453,9 @@ namespace
         MeshFirstPlanStats plan_stats{};
         std::vector<MeshFirstPlanSample> plan_samples{};
         std::string planner_failure{};
-        if (!mesh_first_generate_plan_samples_from_runtime_cache(profile,
+        if (!mesh_first_generate_plan_samples_from_runtime_cache(profile_available ? &profile : nullptr,
                                                                  runtime_triangle_cache.triangles,
+                                                                 active_texture_size,
                                                                  center_ray.location,
                                                                  camera_direction,
                                                                  region_axis,
@@ -6360,7 +6578,7 @@ namespace
         if (research_artifacts)
         {
             mesh_first_write_uv_debug_artifacts(plan_samples,
-                                                profile.texture_size,
+                                                active_texture_size,
                                                 enable_front,
                                                 enable_side,
                                                 enable_back,
@@ -6374,7 +6592,7 @@ namespace
         brush.Hardness = 1.0f;
         brush.Opacity = 1.0f;
         const double stroke_radius_texels = tuning_stroke_size_texels;
-        const double stroke_radius_uv = stroke_radius_texels / static_cast<double>(std::max(1, profile.texture_size));
+        const double stroke_radius_uv = stroke_radius_texels / static_cast<double>(std::max(1, active_texture_size));
         brush.Radius = static_cast<float>(stroke_radius_uv);
         brush.Spacing = 1.0f;
         brush.Falloff = sdk::EBrushFalloff::Spherical;
