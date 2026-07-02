@@ -1,0 +1,6 @@
+[submodule "third_party/CUE4Parse"]
+	path = third_party/CUE4Parse
+	url = https://github.com/FabianFG/CUE4Parse
+[submodule "third_party/UnrealMappingsDumper"]
+	path = third_party/UnrealMappingsDumper
+	url = https://github.com/TheNaeem/UnrealMappingsDumper

@@ -26,6 +26,8 @@ $ImguiRoot = Join-Path $RuntimeRoot "third_party\imgui"
 $ImguiBackendRoot = Join-Path $ImguiRoot "backends"
 $IconSource = Join-Path $RuntimeRoot "assets\icon.ico"
 $IconPngSource = Join-Path $RuntimeRoot "assets\icon.png"
+$MeshProfilesSourceDir = Join-Path $RuntimeRoot "assets\mesh-profiles"
+$MeshProfileResourceSource = Join-Path $MeshProfilesSourceDir "paintman.mesh-profile-v2.json"
 $PrimaryFontArchive = Join-Path $RuntimeRoot "assets\fonts\arial.zip"
 $FallbackFontArchive = Join-Path $RuntimeRoot "assets\fonts\helvetica-255.zip"
 $FontExtractDir = Join-Path $ObjDir "fonts"
@@ -50,6 +52,12 @@ if (-not (Test-Path $IconSource)) {
 }
 if (-not (Test-Path $IconPngSource)) {
     throw "Application icon PNG not found: $IconPngSource"
+}
+if (-not (Test-Path $MeshProfilesSourceDir -PathType Container)) {
+    throw "Mesh profile asset directory not found: $MeshProfilesSourceDir"
+}
+if (-not (Test-Path $MeshProfileResourceSource -PathType Leaf)) {
+    throw "Required mesh profile asset not found: $MeshProfileResourceSource"
 }
 if (-not (Test-Path $PrimaryFontArchive) -and -not (Test-Path $FallbackFontArchive)) {
     throw "Application font archive not found. Expected $PrimaryFontArchive or $FallbackFontArchive"
@@ -167,6 +175,12 @@ try {
     if (-not (Test-Path $BridgeOutput)) { throw "Bridge DLL was not produced: $BridgeOutput" }
     $MeshProfilesOutputDir = Join-Path $OutDir "mesh-profiles"
     Remove-Item -Recurse -Force $MeshProfilesOutputDir -ErrorAction SilentlyContinue
+    $MeshProfiles = @(Get-ChildItem -Path $MeshProfilesSourceDir -Filter "*.json" -File)
+    if ($MeshProfiles.Count -le 0) {
+        throw "No mesh profile JSON assets found in: $MeshProfilesSourceDir"
+    }
+    New-Item -ItemType Directory -Force -Path $MeshProfilesOutputDir | Out-Null
+    Copy-Item -Force -Path (Join-Path $MeshProfilesSourceDir "*.json") -Destination $MeshProfilesOutputDir
 
     $ResourceRc = Join-Path $ObjDir "controller.rc"
     $ResourceRes = Join-Path $ObjDir "controller.res"
@@ -189,6 +203,7 @@ try {
     }
 $IconResourcePath = ((Resolve-Path $IconSource).Path -replace '\\', '\\')
 $IconPngResourcePath = ((Resolve-Path $IconPngSource).Path -replace '\\', '\\')
+$MeshProfileResourcePath = ((Resolve-Path $MeshProfileResourceSource).Path -replace '\\', '\\')
 $FontRegularResourcePath = ((Resolve-Path $FontRegularPath).Path -replace '\\', '\\')
 $FontSemiBoldResourcePath = ((Resolve-Path $FontSemiBoldPath).Path -replace '\\', '\\')
 $FontBoldResourcePath = ((Resolve-Path $FontBoldPath).Path -replace '\\', '\\')
@@ -199,6 +214,7 @@ Set-Content -Encoding ASCII -Path $ResourceRc -Value @"
 203 RCDATA "$FontSemiBoldResourcePath"
 204 RCDATA "$FontBoldResourcePath"
 205 RCDATA "$IconPngResourcePath"
+301 RCDATA "$MeshProfileResourcePath"
 "@
     Invoke-VsToolCommand -ToolName "rc.exe" -ToolArgs @("/nologo", "/fo", $ResourceRes, $ResourceRc)
 

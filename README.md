@@ -22,11 +22,6 @@ Download the latest `meccha-camouflage.exe` from GitHub Releases:
 Settings are read-only until `Edit` is selected. Use `Save` to apply changes or
 `Cancel` to discard them.
 
-v1.4.0 uses the mesh-first paint route. Game-derived mesh profiles are prepared
-locally from the research tools after game updates; they are not ordinary source
-files. See [docs/research-tools.md](docs/research-tools.md) for the local tool
-setup and update workflow.
-
 Logs are written under:
 
 ```text
@@ -40,6 +35,9 @@ git clone https://github.com/acentrist/MecchaCamouflage.git
 cd MecchaCamouflage
 make run
 ```
+
+Game update work, mesh profile regeneration, and research-tool setup are
+documented in [docs/research-tools.md](docs/research-tools.md).
 
 ## License
 

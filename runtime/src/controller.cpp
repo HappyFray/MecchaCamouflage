@@ -68,7 +68,9 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hwnd, UINT msg
 namespace
 {
     constexpr int BridgeResourceId = 101;
+    constexpr int MeshProfileResourceId = 301;
     constexpr int AppIconResourceId = 201;
+    constexpr wchar_t EmbeddedMeshProfileName[] = L"paintman.mesh-profile-v2.json";
     constexpr LONG MinAppWindowWidth = 1040;
     constexpr LONG MinAppWindowHeight = 600;
     constexpr LONG DefaultAppWindowInset = 80;
@@ -818,6 +820,32 @@ namespace
         return copied;
     }
 
+    void extract_embedded_mesh_profile(const std::filesystem::path& native_dir)
+    {
+        HMODULE module = GetModuleHandleW(nullptr);
+        HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(MeshProfileResourceId), MAKEINTRESOURCEW(10));
+        if (!resource)
+            throw std::runtime_error("embedded mesh profile resource not found");
+        HGLOBAL loaded = LoadResource(module, resource);
+        const DWORD size = SizeofResource(module, resource);
+        const void* data = LockResource(loaded);
+        if (!data || size == 0)
+            throw std::runtime_error("embedded mesh profile resource is empty");
+
+        std::error_code ec;
+        const auto profile_dir = native_dir / L"mesh-profiles";
+        std::filesystem::create_directories(profile_dir, ec);
+        if (ec)
+            throw std::runtime_error("failed to create mesh profile directory");
+        const auto profile_path = profile_dir / EmbeddedMeshProfileName;
+        std::ofstream file(profile_path, std::ios::binary | std::ios::trunc);
+        if (!file)
+            throw std::runtime_error("failed to write embedded mesh profile");
+        file.write(static_cast<const char*>(data), size);
+        if (!file)
+            throw std::runtime_error("failed to finish writing embedded mesh profile");
+    }
+
     auto extract_embedded_bridge(const std::filesystem::path& log_dir, int port) -> std::filesystem::path
     {
         HMODULE module = GetModuleHandleW(nullptr);
@@ -833,6 +861,9 @@ namespace
         const auto native_dir = log_dir / L"native";
         std::error_code ec;
         std::filesystem::create_directories(native_dir, ec);
+        if (ec)
+            throw std::runtime_error("failed to create native runtime directory");
+        extract_embedded_mesh_profile(native_dir);
         const auto bridge_path = native_dir / utf8_to_wide("runtime-bridge-" + hash + "-" + std::to_string(port) + ".dll");
         bool write = true;
         if (std::filesystem::exists(bridge_path, ec))
@@ -1492,11 +1523,11 @@ namespace
         if (stage == "component_world_transform_unavailable")
             return "The live mesh component transform could not be resolved. Paint is blocked because current pose/world placement is not trustworthy.";
         if (stage == "mesh_profile_missing")
-            return "Optional mesh profile data is missing. The runtime mesh cache will be used when available.";
+            return "Required mesh profile data is missing. Paint was blocked instead of falling back to an unverified runtime scan.";
         if (stage == "mesh_profile_identity_mismatch")
-            return "Optional mesh profile data did not match the live mesh. The runtime mesh cache will be used when available.";
+            return "Required mesh profile data did not match the live mesh. Paint was blocked instead of falling back to an unverified runtime scan.";
         if (stage == "mesh_profile_runtime_identity_mismatch")
-            return "The live mesh did not match the optional profile data. Paint was blocked instead of replaying with unsafe region mapping.";
+            return "The live mesh did not match the required profile data. Paint was blocked instead of replaying with unsafe region mapping.";
         return {};
     }
 

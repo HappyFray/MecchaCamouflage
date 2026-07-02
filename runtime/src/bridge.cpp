@@ -4104,11 +4104,11 @@ namespace
         }
         if (profiles.empty())
         {
-            failure = "optional mesh profile catalog is empty; using live runtime triangle cache";
+            failure = "required mesh profile catalog is empty; unverified runtime scan fallback is disabled";
         }
         else
         {
-            failure = "no optional mesh profile matched the live mesh identity";
+            failure = "no required mesh profile matched the live mesh identity; unverified runtime scan fallback is disabled";
             if (invalid_count > 0)
             {
                 failure += " (" + std::to_string(invalid_count) + " invalid profile(s) ignored)";
@@ -6944,7 +6944,7 @@ namespace
         metadata += ",\"selected_mesh_asset_path\":\"" + json_escape(ref.object_path(selected_mesh.asset)) + "\"";
 
         write_bridge_progress("mesh_profile_load",
-                              "Loading optional mesh profile",
+                              "Loading required mesh profile",
                               1,
                               4,
                               0.0,
@@ -6962,11 +6962,19 @@ namespace
         }
         else
         {
-            metadata += ",\"mesh_profile_stage\":\"" + std::string(profile_catalog.empty() ? "mesh_profile_missing" : "mesh_profile_identity_mismatch") + "\"";
+            const std::string profile_stage = profile_catalog.empty() ? "mesh_profile_missing" : "mesh_profile_identity_mismatch";
+            metadata += ",\"mesh_profile_stage\":\"" + profile_stage + "\"";
             metadata += ",\"mesh_profile_ok\":false";
-            metadata += ",\"mesh_profile_failure\":\"" + json_escape(profile_failure.empty() ? "optional mesh profile is unavailable or does not match the live mesh" : profile_failure) + "\"";
+            metadata += ",\"mesh_profile_failure\":\"" + json_escape(profile_failure.empty() ? "required mesh profile is unavailable or does not match the live mesh" : profile_failure) + "\"";
             metadata += ",\"mesh_identity_match\":false";
-            metadata += ",\"runtime_dynamic_profile_required\":false";
+            metadata += ",\"profile_required\":true";
+            metadata += ",\"dynamic_runtime_scan_fallback_enabled\":false";
+            return response_json(false,
+                                 profile_stage.c_str(),
+                                 0,
+                                 1,
+                                 "mesh profile is required; dynamic runtime scan fallback is disabled",
+                                 metadata + ",\"replay_blocked\":true");
         }
 
         write_bridge_progress("pose_resolve",
@@ -6988,7 +6996,7 @@ namespace
         else
         {
             pose.stage = "pose_skipped_profile_unavailable";
-            pose.message = "profile-free runtime triangle planning does not require skeletal pose resolution";
+            pose.message = "profile-free runtime triangle planning is disabled";
             pose.source = "runtime_triangle_cache";
             pose.validation_failure = "profile_unavailable";
         }
@@ -7055,18 +7063,13 @@ namespace
         std::string runtime_triangle_profile_cache_failure{};
         auto resolve_runtime_triangle_cache_once = [&]() {
             MeshFirstRuntimeTriangleCache cache{};
-            std::string mode{};
+            std::string mode{"profile_verified"};
             std::string profile_cache_failure{};
-            if (profile_available)
-            {
-                cache = mesh_first_resolve_runtime_triangle_cache(ctx.component, profile);
-                mode = "profile_verified";
-            }
+            cache = mesh_first_resolve_runtime_triangle_cache(ctx.component, profile);
             if (!cache.ok)
             {
                 profile_cache_failure = cache.failure;
-                cache = mesh_first_resolve_runtime_triangle_cache_dynamic(ctx.component);
-                mode = "dynamic_runtime_scan";
+                mode = "profile_verified_failed";
             }
             return std::make_tuple(std::move(cache), std::move(mode), std::move(profile_cache_failure));
         };
@@ -7251,9 +7254,7 @@ namespace
             runtime_world_rebuild =
                 mesh_first_rebuild_runtime_triangle_world_from_local(runtime_world_rebuild_probe_triangles, component_to_world);
             runtime_world_rebuild.applied = false;
-            runtime_world_rebuild.mode = runtime_triangle_cache_mode == "dynamic_runtime_scan"
-                                             ? "diagnostic_skipped_uv_only_dynamic_runtime"
-                                             : "diagnostic_skipped_uv_only_runtime";
+            runtime_world_rebuild.mode = "diagnostic_skipped_uv_only_runtime";
             runtime_projection_selection = raw_runtime_projection_selection;
         }
         metadata += ",\"runtime_triangle_world_rebuild_required\":" + std::string(json_bool(runtime_world_rebuild_required));

@@ -35,4 +35,13 @@ jobs:
         run: |
           $version = "ci-$env:GITHUB_RUN_NUMBER"
           .\scripts\release.ps1 -Version $version
-          if (-not (Test-Path ".build/package/meccha-camouflage-$version.zip")) { throw "package zip missing" }
+          $zipPath = ".build/package/meccha-camouflage-$version.zip"
+          if (-not (Test-Path $zipPath)) { throw "package zip missing" }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $zipPath))
+          try {
+            $profile = $zip.Entries | Where-Object { $_.FullName -eq "mesh-profiles/paintman.mesh-profile-v2.json" } | Select-Object -First 1
+            if (-not $profile) { throw "mesh profile missing from package" }
+          } finally {
+            $zip.Dispose()
+          }
