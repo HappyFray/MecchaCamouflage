@@ -22,6 +22,18 @@ code without growing accidental complexity.
 Do not mix unrelated runtime, GUI, research, and packaging changes in one diff
 unless the change is a deliberate architecture migration.
 
+## Bridge Loader
+
+The injected lifecycle entry point is `bridge-loader.dll`. The loader supervises
+loading, starting, stopping, status reporting, and conditional unloading of the
+versioned bridge DLL.
+
+The loader must remain small. It must not contain UE reflection, paint routing,
+texture preview logic, or `ProcessEvent` behavior. Those stay in
+`runtime-bridge.dll`.
+
+Loader design rules live in `docs/bridge-loader-design.md`.
+
 ## Dead-Code Review
 
 Generate a report-only inventory:

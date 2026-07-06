@@ -36,6 +36,7 @@ Confirm:
 
 The packaged EXE must include:
 
+- native bridge loader DLL
 - native bridge DLL
 - native injector EXE
 - WebView2 Fixed Runtime

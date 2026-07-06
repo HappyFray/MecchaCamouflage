@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "../include/sdk.hpp"
+#include "../include/bridge_loader_abi.hpp"
 
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "Gdi32.lib")
@@ -82,11 +83,18 @@ namespace
     constexpr std::uintptr_t OffFStructPropertyStruct = 0x70;
 
     HMODULE g_module = nullptr;
-    std::atomic<bool> g_running{true};
+    std::atomic<bool> g_running{false};
+    std::atomic<int> g_bridge_state{MC_BRIDGE_CREATED};
+    std::atomic<DWORD> g_bridge_last_win32{0};
+    std::mutex g_bridge_thread_mutex;
+    std::unique_ptr<std::thread> g_bridge_thread{};
+    std::atomic<bool> g_bridge_thread_done{true};
     std::atomic<int> g_active_client_handlers{0};
     std::atomic<bool> g_process_event_hook_installed{false};
     std::atomic<std::uintptr_t> g_original_process_event{0};
     std::atomic<HHOOK> g_message_hook{nullptr};
+    std::atomic<std::uint32_t> g_active_hook_callbacks{0};
+    std::atomic<std::uint32_t> g_active_ue_calls{0};
     std::atomic<DWORD> g_game_thread_id{0};
     std::atomic<HWND> g_game_window{nullptr};
     std::atomic<std::uintptr_t> g_observed_sync_channel_function{0};
@@ -1567,16 +1575,20 @@ namespace
             return false;
         }
         auto_event_watch_record(function, params);
+        g_active_ue_calls.fetch_add(1);
+        bool ok = false;
         __try
         {
             reinterpret_cast<ProcessEventFn>(target)(reinterpret_cast<void*>(object), reinterpret_cast<void*>(function), params);
-            return true;
+            ok = true;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
             failure = "process_event_exception";
-            return false;
+            ok = false;
         }
+        g_active_ue_calls.fetch_sub(1);
+        return ok;
     }
 
     auto read_return_bool(Reflection& ref, std::uintptr_t function, std::uint8_t* params) -> bool
@@ -14544,6 +14556,7 @@ namespace
 
     void __fastcall hooked_process_event(void* object, void* function, void* params)
     {
+        g_active_hook_callbacks.fetch_add(1);
         const auto original = g_original_process_event.load();
         (void)object;
         if (function && params)
@@ -14594,10 +14607,12 @@ namespace
         {
             reinterpret_cast<ProcessEventFn>(original)(object, function, params);
         }
+        g_active_hook_callbacks.fetch_sub(1);
     }
 
     LRESULT CALLBACK message_hook_proc(int code, WPARAM wparam, LPARAM lparam)
     {
+        g_active_hook_callbacks.fetch_add(1);
         if (code >= 0)
         {
             const auto* msg = reinterpret_cast<const MSG*>(lparam);
@@ -14612,7 +14627,9 @@ namespace
                 }
             }
         }
-        return CallNextHookEx(g_message_hook.load(), code, wparam, lparam);
+        const auto result = CallNextHookEx(g_message_hook.load(), code, wparam, lparam);
+        g_active_hook_callbacks.fetch_sub(1);
+        return result;
     }
 
     auto paint_full_route_native(const std::string& request) -> std::string
@@ -14809,6 +14826,8 @@ namespace
 
     auto bridge_thread() -> void
     {
+        g_bridge_thread_done.store(false);
+        g_bridge_state.store(MC_BRIDGE_STARTING);
         start_auto_event_watch_if_configured();
 
         const int bridge_port = resolve_bridge_port();
@@ -14817,14 +14836,24 @@ namespace
         WSADATA data{};
         if (WSAStartup(MAKEWORD(2, 2), &data) != 0)
         {
-            write_bridge_listener_status("wsa_startup_failed", bridge_port, WSAGetLastError());
+            const DWORD error = WSAGetLastError();
+            g_bridge_last_win32.store(error);
+            g_bridge_state.store(MC_BRIDGE_FAILED);
+            write_bridge_listener_status("wsa_startup_failed", bridge_port, error);
+            g_running.store(false);
+            g_bridge_thread_done.store(true);
             return;
         }
         SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (listener == INVALID_SOCKET)
         {
-            write_bridge_listener_status("socket_failed", bridge_port, WSAGetLastError());
+            const DWORD error = WSAGetLastError();
+            g_bridge_last_win32.store(error);
+            g_bridge_state.store(MC_BRIDGE_FAILED);
+            write_bridge_listener_status("socket_failed", bridge_port, error);
             WSACleanup();
+            g_running.store(false);
+            g_bridge_thread_done.store(true);
             return;
         }
         sockaddr_in addr{};
@@ -14835,18 +14864,30 @@ namespace
         setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&yes), sizeof(yes));
         if (bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR)
         {
-            write_bridge_listener_status("bind_failed", bridge_port, WSAGetLastError());
+            const DWORD error = WSAGetLastError();
+            g_bridge_last_win32.store(error);
+            g_bridge_state.store(MC_BRIDGE_FAILED);
+            write_bridge_listener_status("bind_failed", bridge_port, error);
             closesocket(listener);
             WSACleanup();
+            g_running.store(false);
+            g_bridge_thread_done.store(true);
             return;
         }
         if (listen(listener, 4) == SOCKET_ERROR)
         {
-            write_bridge_listener_status("listen_failed", bridge_port, WSAGetLastError());
+            const DWORD error = WSAGetLastError();
+            g_bridge_last_win32.store(error);
+            g_bridge_state.store(MC_BRIDGE_FAILED);
+            write_bridge_listener_status("listen_failed", bridge_port, error);
             closesocket(listener);
             WSACleanup();
+            g_running.store(false);
+            g_bridge_thread_done.store(true);
             return;
         }
+        g_bridge_last_win32.store(0);
+        g_bridge_state.store(MC_BRIDGE_RUNNING_LISTENING);
         write_bridge_listener_status("listening", bridge_port);
         while (g_running.load())
         {
@@ -14859,7 +14900,10 @@ namespace
             const int selected = select(0, &read_set, nullptr, nullptr, &timeout);
             if (selected == SOCKET_ERROR)
             {
-                write_bridge_listener_status("select_failed", bridge_port, WSAGetLastError());
+                const DWORD error = WSAGetLastError();
+                g_bridge_last_win32.store(error);
+                g_bridge_state.store(MC_BRIDGE_FAILED);
+                write_bridge_listener_status("select_failed", bridge_port, error);
                 break;
             }
             if (selected == 0)
@@ -14874,7 +14918,9 @@ namespace
             g_active_client_handlers.fetch_add(1);
             std::thread(handle_bridge_client, client).detach();
         }
+        g_running.store(false);
         write_bridge_listener_status("stopping", bridge_port);
+        g_bridge_state.store(MC_BRIDGE_STOPPING);
         closesocket(listener);
         while (g_active_client_handlers.load() > 0)
         {
@@ -14883,13 +14929,259 @@ namespace
         WSACleanup();
         write_bridge_listener_status("stopped", bridge_port);
         uninstall_process_event_hook();
-        HMODULE module = g_module;
-        g_module = nullptr;
-        if (module != nullptr)
+        g_bridge_state.store(MC_BRIDGE_UNLOADABLE);
+        g_bridge_thread_done.store(true);
+    }
+}
+
+namespace
+{
+    std::mutex g_bridge_api_mutex;
+    std::string g_bridge_build_id{"runtime-bridge"};
+
+    auto copy_status_text(char* target, std::size_t target_size, const std::string& text) -> void
+    {
+        if (!target || target_size == 0)
         {
-            FreeLibraryAndExitThread(module, 0);
+            return;
+        }
+        const auto count = std::min(target_size - 1, text.size());
+        std::memcpy(target, text.data(), count);
+        target[count] = '\0';
+    }
+
+    auto bridge_unload_blockers() -> std::uint32_t
+    {
+        std::uint32_t blockers = MC_BLOCK_NONE;
+        if (g_running.load())
+        {
+            blockers |= MC_BLOCK_LISTENER;
+        }
+        if (g_active_client_handlers.load() > 0)
+        {
+            blockers |= MC_BLOCK_CLIENTS;
+        }
+        bool hook_slots_present = false;
+        {
+            std::lock_guard<std::mutex> lock(g_hook_mutex);
+            hook_slots_present = !g_process_event_hook_slots.empty();
+        }
+        if (g_process_event_hook_installed.load() || g_message_hook.load() != nullptr || hook_slots_present)
+        {
+            blockers |= MC_BLOCK_HOOKS;
+        }
+        if (g_active_hook_callbacks.load() > 0)
+        {
+            blockers |= MC_BLOCK_HOOK_CALLBACKS;
+        }
+        if (g_active_ue_calls.load() > 0)
+        {
+            blockers |= MC_BLOCK_UE_CALLS;
+        }
+        bool paint_jobs_present = false;
+        {
+            std::lock_guard<std::mutex> lock(g_paint_jobs_mutex);
+            paint_jobs_present = !g_paint_jobs.empty();
+        }
+        if (paint_jobs_present)
+        {
+            blockers |= MC_BLOCK_PAINT_QUEUE;
+        }
+        if (mesh_first_preview_snapshot_copy().available)
+        {
+            blockers |= MC_BLOCK_PREVIEW_STATE;
+        }
+        if (!g_bridge_thread_done.load())
+        {
+            blockers |= MC_BLOCK_WORKERS;
+        }
+        return blockers;
+    }
+
+    auto bridge_fill_status(McBridgeStatus* outStatus) -> McResult
+    {
+        if (!outStatus || outStatus->size < sizeof(McBridgeStatus))
+        {
+            return MC_E_INVALID_ARGUMENT;
+        }
+        const auto state = static_cast<McBridgeRunState>(g_bridge_state.load());
+        const auto blockers = bridge_unload_blockers();
+        std::memset(outStatus, 0, sizeof(McBridgeStatus));
+        outStatus->size = sizeof(McBridgeStatus);
+        outStatus->state = state;
+        outStatus->lastResult = blockers == MC_BLOCK_NONE ? MC_OK : MC_E_UNLOAD_BLOCKED;
+        outStatus->lastWin32 = g_bridge_last_win32.load();
+        outStatus->unloadBlockers = blockers;
+        outStatus->activeHookCallbacks = g_active_hook_callbacks.load();
+        outStatus->activeUeCalls = g_active_ue_calls.load();
+        outStatus->activeWorkers = g_bridge_thread_done.load() ? 0 : 1;
+        outStatus->activeClients = static_cast<std::uint32_t>(std::max(0, g_active_client_handlers.load()));
+        {
+            std::lock_guard<std::mutex> lock(g_paint_jobs_mutex);
+            outStatus->queuedPaintBatches = static_cast<std::uint32_t>(g_paint_jobs.size());
+        }
+        outStatus->tcpPort = static_cast<std::uint16_t>(resolve_bridge_port());
+        copy_status_text(outStatus->bridgeBuildIdUtf8, sizeof(outStatus->bridgeBuildIdUtf8), g_bridge_build_id);
+        switch (state)
+        {
+        case MC_BRIDGE_RUNNING_LISTENING:
+            copy_status_text(outStatus->lastStepUtf8, sizeof(outStatus->lastStepUtf8), "listening");
+            break;
+        case MC_BRIDGE_UNLOADABLE:
+            copy_status_text(outStatus->lastStepUtf8, sizeof(outStatus->lastStepUtf8), "unloadable");
+            break;
+        case MC_BRIDGE_FAILED:
+            copy_status_text(outStatus->lastStepUtf8, sizeof(outStatus->lastStepUtf8), "failed");
+            break;
+        default:
+            copy_status_text(outStatus->lastStepUtf8, sizeof(outStatus->lastStepUtf8), "lifecycle");
+            break;
+        }
+        if (blockers != MC_BLOCK_NONE)
+        {
+            copy_status_text(outStatus->lastErrorUtf8, sizeof(outStatus->lastErrorUtf8), "bridge still has unload blockers");
+        }
+        return MC_OK;
+    }
+
+    McResult WINAPI bridge_api_create(const McBridgeStartInfo* startInfo, const McBridgeHostApi*, McBridgeHandle* outHandle)
+    {
+        if (!outHandle || !startInfo || startInfo->size < sizeof(McBridgeStartInfo))
+        {
+            return MC_E_INVALID_ARGUMENT;
+        }
+        if (startInfo->bridgeBuildIdUtf8 && startInfo->bridgeBuildIdUtf8[0] != '\0')
+        {
+            g_bridge_build_id = startInfo->bridgeBuildIdUtf8;
+        }
+        *outHandle = reinterpret_cast<McBridgeHandle>(&g_module);
+        return MC_OK;
+    }
+
+    McResult WINAPI bridge_api_start(McBridgeHandle handle)
+    {
+        if (!handle)
+        {
+            return MC_E_INVALID_ARGUMENT;
+        }
+        std::lock_guard<std::mutex> lock(g_bridge_api_mutex);
+        if (g_bridge_thread && g_bridge_thread->joinable() && g_bridge_thread_done.load())
+        {
+            g_bridge_thread->join();
+            g_bridge_thread.reset();
+        }
+        if (g_bridge_thread && !g_bridge_thread_done.load())
+        {
+            return MC_E_ALREADY_STARTED;
+        }
+        try
+        {
+            g_running.store(true);
+            g_bridge_last_win32.store(0);
+            g_bridge_state.store(MC_BRIDGE_STARTING);
+            g_bridge_thread_done.store(false);
+            g_bridge_thread = std::make_unique<std::thread>(bridge_thread);
+            return MC_OK;
+        }
+        catch (...)
+        {
+            g_running.store(false);
+            g_bridge_thread_done.store(true);
+            g_bridge_state.store(MC_BRIDGE_FAILED);
+            return MC_E_START_FAILED;
         }
     }
+
+    McResult WINAPI bridge_api_request_stop(McBridgeHandle handle, std::uint32_t)
+    {
+        if (!handle)
+        {
+            return MC_E_INVALID_ARGUMENT;
+        }
+        g_bridge_state.store(MC_BRIDGE_STOPPING);
+        force_cancel_active_mesh_first_batch_job("loader_stop");
+        cancel_queued_paint_jobs("loader_stop");
+        uninstall_process_event_hook();
+        g_running.store(false);
+        return MC_OK;
+    }
+
+    McResult WINAPI bridge_api_join_stop(McBridgeHandle handle, std::uint32_t timeoutMs)
+    {
+        if (!handle)
+        {
+            return MC_E_INVALID_ARGUMENT;
+        }
+        const auto start = GetTickCount64();
+        while (!g_bridge_thread_done.load())
+        {
+            if (timeoutMs > 0 && GetTickCount64() - start >= timeoutMs)
+            {
+                return MC_E_STOP_TIMED_OUT;
+            }
+            Sleep(25);
+        }
+        std::lock_guard<std::mutex> lock(g_bridge_api_mutex);
+        if (g_bridge_thread && g_bridge_thread->joinable())
+        {
+            g_bridge_thread->join();
+            g_bridge_thread.reset();
+        }
+        const auto blockers = bridge_unload_blockers();
+        g_bridge_state.store(blockers == MC_BLOCK_NONE ? MC_BRIDGE_UNLOADABLE : MC_BRIDGE_STOPPED);
+        return blockers == MC_BLOCK_NONE ? MC_OK : MC_E_UNLOAD_BLOCKED;
+    }
+
+    McResult WINAPI bridge_api_get_status(McBridgeHandle handle, McBridgeStatus* outStatus)
+    {
+        if (!handle)
+        {
+            return MC_E_INVALID_ARGUMENT;
+        }
+        return bridge_fill_status(outStatus);
+    }
+
+    McResult WINAPI bridge_api_destroy(McBridgeHandle handle)
+    {
+        if (!handle)
+        {
+            return MC_E_INVALID_ARGUMENT;
+        }
+        if (!g_bridge_thread_done.load() || bridge_unload_blockers() != MC_BLOCK_NONE)
+        {
+            return MC_E_UNLOAD_BLOCKED;
+        }
+        return MC_OK;
+    }
+
+    McBridgeApi g_bridge_api{
+        sizeof(McBridgeApi),
+        McLoaderAbiMajor,
+        McLoaderAbiMinor,
+        0,
+        bridge_api_create,
+        bridge_api_start,
+        bridge_api_request_stop,
+        bridge_api_join_stop,
+        bridge_api_get_status,
+        bridge_api_destroy,
+    };
+}
+
+extern "C" __declspec(dllexport) McResult WINAPI McBridge_GetApi(std::uint32_t loaderAbiMajor,
+                                                                  std::uint32_t,
+                                                                  McBridgeApi* outApi)
+{
+    if (!outApi || outApi->size < sizeof(McBridgeApi))
+    {
+        return MC_E_INVALID_ARGUMENT;
+    }
+    if (loaderAbiMajor != McLoaderAbiMajor)
+    {
+        return MC_E_ABI_INCOMPATIBLE;
+    }
+    *outApi = g_bridge_api;
+    return MC_OK;
 }
 
 // =============================================================================
@@ -14903,7 +15195,6 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
     {
         DisableThreadLibraryCalls(module);
         g_module = module;
-        std::thread(bridge_thread).detach();
     }
     if (reason == DLL_PROCESS_DETACH)
     {

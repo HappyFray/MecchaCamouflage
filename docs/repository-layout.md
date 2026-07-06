@@ -17,6 +17,8 @@ src/
   native/
     bridge/
       bridge.cpp
+    loader/
+      loader.cpp
     injector/
       injector.cpp
     include/
@@ -121,6 +123,7 @@ Important paths:
 
 ```text
 %LOCALAPPDATA%\MecchaCamouflage\versions\<version>\
+%LOCALAPPDATA%\MecchaCamouflage\bridge-loaders\
 %LOCALAPPDATA%\MecchaCamouflage\bridge-state\
 ```
 
@@ -129,6 +132,10 @@ data live under `versions/<version>/`.
 
 Bridge live state, such as progress snapshots tied to an injected bridge in the
 game process, lives under `bridge-state/`.
+
+Stable injected loader DLLs live under `bridge-loaders/` by loader content hash.
+Do not move loader DLLs under `versions/<version>/`; bridge-only rebuilds must
+remain switchable through an already loaded loader.
 
 Repository `src/` and app LocalAppData runtime state are intentionally separate
 concepts.

@@ -3,6 +3,9 @@
 This document maps the responsibilities inside `src/native/bridge/bridge.cpp`.
 Use it before deleting code, moving code, or changing bridge command behavior.
 
+Bridge lifecycle supervision is owned by `src/native/loader/loader.cpp`; see
+`docs/bridge-loader-design.md`.
+
 Current policy: do not delete or split bridge code before the code path is
 classified. Static reference count is not enough in this runtime because many
 entries are reached by IPC command strings, Win32 callbacks, UE reflection, or

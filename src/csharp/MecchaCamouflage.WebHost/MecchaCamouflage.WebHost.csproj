@@ -50,6 +50,9 @@
     <EmbeddedResource Include="$(MecchaNativeRuntimeDir)\runtime-bridge.dll" Condition="'$(MecchaNativeRuntimeDir)' != ''">
       <LogicalName>packaged/native/runtime-bridge.dll</LogicalName>
     </EmbeddedResource>
+    <EmbeddedResource Include="$(MecchaNativeRuntimeDir)\bridge-loader.dll" Condition="'$(MecchaNativeRuntimeDir)' != ''">
+      <LogicalName>packaged/native/bridge-loader.dll</LogicalName>
+    </EmbeddedResource>
     <EmbeddedResource Include="$(MecchaNativeRuntimeDir)\runtime-injector.exe" Condition="'$(MecchaNativeRuntimeDir)' != ''">
       <LogicalName>packaged/native/runtime-injector.exe</LogicalName>
     </EmbeddedResource>

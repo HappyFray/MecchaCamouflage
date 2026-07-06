@@ -50,10 +50,12 @@ public sealed class AppPaths
         Directory.CreateDirectory(DiagnosticsDirectory);
     }
 
-    public string RuntimeHashDirectory(string bridgePath, string injectorPath)
+    public string RuntimeHashDirectory(params string[] paths)
     {
+        if (paths.Length == 0)
+            throw new ArgumentException("At least one runtime file is required.", nameof(paths));
         using var sha = SHA256.Create();
-        foreach (var path in new[] { bridgePath, injectorPath })
+        foreach (var path in paths)
         {
             var bytes = File.ReadAllBytes(path);
             sha.TransformBlock(bytes, 0, bytes.Length, null, 0);
@@ -63,14 +65,19 @@ public sealed class AppPaths
         return Path.Combine(RuntimeBinDirectory, hash);
     }
 
-    public void CleanupRuntimeBinDirectories(string keepDirectory, TimeSpan maxAge, int keepNewest = 3)
+    public void CleanupRuntimeBinDirectories(string keepDirectory, TimeSpan maxAge, int keepNewest = 3) =>
+        CleanupRuntimeBinDirectories([keepDirectory], maxAge, keepNewest);
+
+    public void CleanupRuntimeBinDirectories(IReadOnlyCollection<string> keepDirectories, TimeSpan maxAge, int keepNewest = 3)
     {
         Directory.CreateDirectory(RuntimeBinDirectory);
-        var keepFullPath = NormalizeDirectory(keepDirectory);
+        var keepFullPaths = keepDirectories
+            .Select(NormalizeDirectory)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
         var cutoff = DateTime.UtcNow - maxAge;
         var directories = Directory.GetDirectories(RuntimeBinDirectory)
             .Select(path => new DirectoryInfo(path))
-            .Where(info => !string.Equals(NormalizeDirectory(info.FullName), keepFullPath, StringComparison.OrdinalIgnoreCase))
+            .Where(info => !keepFullPaths.Contains(NormalizeDirectory(info.FullName)))
             .OrderByDescending(info => info.LastWriteTimeUtc)
             .ToArray();
 

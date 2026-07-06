@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <tlhelp32.h>
 
+#include <cstdint>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -105,6 +106,50 @@ namespace
         return pid;
     }
 
+    auto same_path(const std::wstring& left, const std::wstring& right) -> bool
+    {
+        return _wcsicmp(left.c_str(), right.c_str()) == 0;
+    }
+
+    auto remote_module_base(DWORD pid, const std::wstring& dll_path) -> std::uintptr_t
+    {
+        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+        if (snapshot == INVALID_HANDLE_VALUE)
+        {
+            return 0;
+        }
+        MODULEENTRY32W entry{};
+        entry.dwSize = sizeof(entry);
+        std::uintptr_t result = 0;
+        if (Module32FirstW(snapshot, &entry))
+        {
+            do
+            {
+                if (same_path(entry.szExePath, dll_path))
+                {
+                    result = reinterpret_cast<std::uintptr_t>(entry.modBaseAddr);
+                    break;
+                }
+            } while (Module32NextW(snapshot, &entry));
+        }
+        CloseHandle(snapshot);
+        return result;
+    }
+
+    auto local_export_rva(const std::wstring& dll_path, const char* export_name) -> std::uintptr_t
+    {
+        HMODULE local = LoadLibraryExW(dll_path.c_str(), nullptr, DONT_RESOLVE_DLL_REFERENCES);
+        if (!local)
+        {
+            return 0;
+        }
+        auto* proc = reinterpret_cast<std::uint8_t*>(GetProcAddress(local, export_name));
+        auto* base = reinterpret_cast<std::uint8_t*>(local);
+        const auto rva = proc ? static_cast<std::uintptr_t>(proc - base) : 0;
+        FreeLibrary(local);
+        return rva;
+    }
+
     auto inject_dll(DWORD pid, const std::wstring& dll_path) -> int
     {
         write_event("open_process", true, 0, {}, pid);
@@ -176,6 +221,77 @@ namespace
         }
         return 0;
     }
+
+    auto call_remote_loader_main(DWORD pid, const std::wstring& loader_path, const std::wstring& config_path) -> int
+    {
+        write_event("loader_remote_main_prepare", true, 0, utf8(config_path), pid);
+        const auto remote_base = remote_module_base(pid, loader_path);
+        if (!remote_base)
+        {
+            write_event("loader_module_lookup", false, GetLastError(), "bridge-loader.dll module not found in target", pid);
+            std::wcerr << L"bridge-loader.dll module not found in target\n";
+            return 7;
+        }
+        const auto export_rva = local_export_rva(loader_path, "McLoader_RemoteMain");
+        if (!export_rva)
+        {
+            write_event("loader_export_lookup", false, GetLastError(), "McLoader_RemoteMain export not found", pid);
+            std::wcerr << L"McLoader_RemoteMain export not found\n";
+            return 8;
+        }
+
+        HANDLE process = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
+                                         PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
+                                     FALSE,
+                                     pid);
+        if (!process)
+        {
+            const auto error = GetLastError();
+            write_event("loader_open_process", false, error, "OpenProcess failed", pid);
+            return 2;
+        }
+        const SIZE_T bytes = (config_path.size() + 1) * sizeof(wchar_t);
+        LPVOID remote_config = VirtualAllocEx(process, nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!remote_config)
+        {
+            const auto error = GetLastError();
+            write_event("loader_config_alloc", false, error, "VirtualAllocEx failed", pid);
+            CloseHandle(process);
+            return 3;
+        }
+        if (!WriteProcessMemory(process, remote_config, config_path.c_str(), bytes, nullptr))
+        {
+            const auto error = GetLastError();
+            write_event("loader_config_write", false, error, "WriteProcessMemory failed", pid);
+            VirtualFreeEx(process, remote_config, 0, MEM_RELEASE);
+            CloseHandle(process);
+            return 4;
+        }
+
+        auto remote_main = reinterpret_cast<LPTHREAD_START_ROUTINE>(remote_base + export_rva);
+        write_event("loader_remote_main_thread", true, 0, "McLoader_RemoteMain", pid);
+        HANDLE thread = CreateRemoteThread(process, nullptr, 0, remote_main, remote_config, 0, nullptr);
+        if (!thread)
+        {
+            const auto error = GetLastError();
+            write_event("loader_remote_main_thread", false, error, "CreateRemoteThread failed", pid);
+            VirtualFreeEx(process, remote_config, 0, MEM_RELEASE);
+            CloseHandle(process);
+            return 5;
+        }
+        const DWORD wait_result = WaitForSingleObject(thread, 15000);
+        if (wait_result != WAIT_OBJECT_0)
+        {
+            write_event("loader_remote_main_wait", false, wait_result, "McLoader_RemoteMain did not finish", pid);
+        }
+        DWORD remote_exit = 0;
+        GetExitCodeThread(thread, &remote_exit);
+        write_event("loader_remote_main_result", remote_exit == 0, 0, remote_exit == 0 ? "McLoader_RemoteMain returned success" : "McLoader_RemoteMain returned failure", pid, remote_exit);
+        CloseHandle(thread);
+        VirtualFreeEx(process, remote_config, 0, MEM_RELEASE);
+        CloseHandle(process);
+        return remote_exit == 0 ? 0 : 9;
+    }
 }
 
 int wmain(int argc, wchar_t** argv)
@@ -187,12 +303,13 @@ int wmain(int argc, wchar_t** argv)
     }
     if (argc < 3)
     {
-        write_event("arguments", false, 0, "usage: runtime-injector.exe <process.exe> <bridge.dll>");
-        std::wcerr << L"usage: runtime-injector.exe <process.exe> <bridge.dll>\n";
+        write_event("arguments", false, 0, "usage: runtime-injector.exe <process.exe> <loader-or-bridge.dll> [loader-config.json]");
+        std::wcerr << L"usage: runtime-injector.exe <process.exe> <loader-or-bridge.dll> [loader-config.json]\n";
         return 64;
     }
     const std::wstring process_name = argv[1];
     const std::wstring dll_path = argv[2];
+    const std::wstring config_path = argc >= 4 ? argv[3] : L"";
     const DWORD pid = find_process_id(process_name);
     if (!pid)
     {
@@ -201,6 +318,14 @@ int wmain(int argc, wchar_t** argv)
         return 1;
     }
     const int result = inject_dll(pid, dll_path);
+    if (result == 0 && !config_path.empty())
+    {
+        const int loader_result = call_remote_loader_main(pid, dll_path, config_path);
+        if (loader_result != 0)
+        {
+            return loader_result;
+        }
+    }
     if (result == 0)
     {
         write_event("complete", true, 0, utf8(dll_path), pid);

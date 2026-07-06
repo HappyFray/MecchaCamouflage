@@ -325,6 +325,8 @@ public static class PackagedAssets
     private static string RoleFor(string logicalPath)
     {
         var normalized = logicalPath.Replace('\\', '/');
+        if (string.Equals(normalized, "native/bridge-loader.dll", StringComparison.OrdinalIgnoreCase))
+            return "native.bridge-loader";
         if (string.Equals(normalized, "native/runtime-bridge.dll", StringComparison.OrdinalIgnoreCase))
             return "native.bridge";
         if (string.Equals(normalized, "native/runtime-injector.exe", StringComparison.OrdinalIgnoreCase))

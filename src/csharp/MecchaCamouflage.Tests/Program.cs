@@ -9,6 +9,7 @@ var tests = new List<(string Name, Action Run)>
     ("locales have complete keys", LocalesHaveCompleteKeys),
     ("color parser accepts rrggbb", ColorParserAcceptsHex),
     ("runtime cleanup removes old hash dirs", RuntimeCleanupRemovesOldHashDirs),
+    ("runtime cleanup keeps loader and bridge dirs", RuntimeCleanupKeepsLoaderAndBridgeDirs),
     ("runtime log keeps repeated guard messages", RuntimeLogKeepsRepeatedGuardMessages),
     ("asset validation rejects stale ready cache", AssetValidationRejectsStaleReadyCache),
     ("copy if invalid repairs corrupt target", CopyIfInvalidRepairsCorruptTarget),
@@ -139,6 +140,28 @@ static void RuntimeCleanupRemovesOldHashDirs()
     Assert(Directory.Exists(keep), "current hash dir should be kept");
     Assert(Directory.Exists(recent), "recent hash dir should be kept");
     Assert(!Directory.Exists(old), "old hash dir should be removed");
+}
+
+static void RuntimeCleanupKeepsLoaderAndBridgeDirs()
+{
+    using var temp = new TempHome();
+    var paths = new AppPaths("cleanup-multi-keep-test");
+    var loader = Path.Combine(paths.RuntimeBinDirectory, "loader-current");
+    var bridge = Path.Combine(paths.RuntimeBinDirectory, "bridge-current");
+    var old = Path.Combine(paths.RuntimeBinDirectory, "bridge-old");
+    Directory.CreateDirectory(loader);
+    Directory.CreateDirectory(bridge);
+    Directory.CreateDirectory(old);
+    File.WriteAllText(Path.Combine(loader, "bridge-loader.dll"), "");
+    File.WriteAllText(Path.Combine(bridge, "runtime-bridge.dll"), "");
+    File.WriteAllText(Path.Combine(old, "runtime-bridge.dll"), "");
+    Directory.SetLastWriteTimeUtc(old, DateTime.UtcNow - TimeSpan.FromDays(30));
+
+    paths.CleanupRuntimeBinDirectories([loader, bridge], TimeSpan.FromDays(14), keepNewest: 2);
+
+    Assert(Directory.Exists(loader), "loader runtime dir should be kept");
+    Assert(Directory.Exists(bridge), "bridge runtime dir should be kept");
+    Assert(!Directory.Exists(old), "old bridge runtime dir should be removed");
 }
 
 static void RuntimeLogKeepsRepeatedGuardMessages()

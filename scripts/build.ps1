@@ -159,9 +159,12 @@ function Ensure-WebView2FixedRuntime {
     return $RuntimeDir
 }
 
-function Assert-BridgeDependencyAllowList {
-    param([Parameter(Mandatory = $true)][string]$Path)
-    $Allowed = @("KERNEL32.dll", "USER32.dll", "WS2_32.dll")
+function Assert-NativeDependencyAllowList {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string[]]$Allowed,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
     $Output = Invoke-VsToolCapture -ToolName "dumpbin.exe" -ToolArgs @("/nologo", "/dependents", $Path)
     $Dlls = @($Output | ForEach-Object {
         $line = $_.ToString().Trim()
@@ -169,7 +172,7 @@ function Assert-BridgeDependencyAllowList {
     } | Sort-Object -Unique)
     $Unexpected = @($Dlls | Where-Object { $Allowed -notcontains $_ })
     if ($Unexpected.Count -gt 0) {
-        throw "runtime-bridge.dll has unexpected dependencies: $($Unexpected -join ', ')"
+        throw "$Label has unexpected dependencies: $($Unexpected -join ', ')"
     }
 }
 
@@ -188,12 +191,13 @@ $WebView2FixedRuntimeUrl = "https://msedge.sf.dl.delivery.mp.microsoft.com/files
 $WebView2CacheRoot = Join-Path $RuntimeRoot ".build\cache\webview2\$WebView2FixedVersion\win-x64"
 
 $BridgeSource = Join-Path $RuntimeRoot "src\native\bridge\bridge.cpp"
+$LoaderSource = Join-Path $RuntimeRoot "src\native\loader\loader.cpp"
 $InjectorSource = Join-Path $RuntimeRoot "src\native\injector\injector.cpp"
 $WebHostProject = Join-Path $RuntimeRoot "src\csharp\MecchaCamouflage.WebHost\MecchaCamouflage.WebHost.csproj"
 $TestsProject = Join-Path $RuntimeRoot "src\csharp\MecchaCamouflage.Tests\MecchaCamouflage.Tests.csproj"
 $MeshProfilesSourceDir = Join-Path $RuntimeRoot "resources\mesh-profiles"
 
-foreach ($path in @($BridgeSource, $InjectorSource, $WebHostProject, $TestsProject)) {
+foreach ($path in @($BridgeSource, $LoaderSource, $InjectorSource, $WebHostProject, $TestsProject)) {
     if (-not (Test-Path $path -PathType Leaf)) {
         throw "Required source not found: $path"
     }
@@ -212,27 +216,43 @@ try {
     Invoke-DotNet -Arguments @("run", "--project", $TestsProject, "-c", "Release")
 
     $BridgeOutput = Join-Path $NativePackageDir "runtime-bridge.dll"
+    $LoaderOutput = Join-Path $NativePackageDir "bridge-loader.dll"
     $InjectorOutput = Join-Path $NativePackageDir "runtime-injector.exe"
     Invoke-VsToolCommand -ToolName "cl.exe" -ToolArgs @(
         "/nologo", "/std:c++17", "/EHsc", "/O2", "/LD", $BridgeSource,
         "/Fo:$(Join-Path $ObjDir 'bridge.obj')",
         "/Fe:$BridgeOutput",
         "Ws2_32.lib",
-        "User32.lib"
+        "User32.lib",
+        "/link",
+        "/Brepro"
+    )
+    Invoke-VsToolCommand -ToolName "cl.exe" -ToolArgs @(
+        "/nologo", "/std:c++17", "/EHsc", "/O2", "/LD", $LoaderSource,
+        "/Fo:$(Join-Path $ObjDir 'loader.obj')",
+        "/Fe:$LoaderOutput",
+        "/link",
+        "/Brepro"
     )
     Invoke-VsToolCommand -ToolName "cl.exe" -ToolArgs @(
         "/nologo", "/EHsc", "/O2", $InjectorSource,
         "/Fo:$(Join-Path $ObjDir 'injector.obj')",
-        "/Fe:$InjectorOutput"
+        "/Fe:$InjectorOutput",
+        "/link",
+        "/Brepro"
     )
 
     if (-not (Test-Path $BridgeOutput -PathType Leaf)) {
         throw "Bridge DLL was not produced: $BridgeOutput"
     }
+    if (-not (Test-Path $LoaderOutput -PathType Leaf)) {
+        throw "Bridge loader DLL was not produced: $LoaderOutput"
+    }
     if (-not (Test-Path $InjectorOutput -PathType Leaf)) {
         throw "Injector EXE was not produced: $InjectorOutput"
     }
-    Assert-BridgeDependencyAllowList -Path $BridgeOutput
+    Assert-NativeDependencyAllowList -Path $BridgeOutput -Allowed @("KERNEL32.dll", "USER32.dll", "WS2_32.dll") -Label "runtime-bridge.dll"
+    Assert-NativeDependencyAllowList -Path $LoaderOutput -Allowed @("KERNEL32.dll") -Label "bridge-loader.dll"
 
     $MeshProfiles = @(Get-ChildItem -Path $MeshProfilesSourceDir -Filter "*.json" -File)
     if ($MeshProfiles.Count -le 0) {
