@@ -195,9 +195,9 @@ Invoke-RgReport -OutputFile "dynamic-entry-hotspots.txt" -Paths $reviewPaths -Pa
 
 Invoke-RgReport -OutputFile "research-probes.txt" -Paths $reviewPaths -Pattern "RESEARCH|research|probe|pressure_probe|packed_replay_probe|paint_replication_probe|MECCHA_RESEARCH_ARTIFACTS|debug_artifact|event_watch|dump|trace"
 
-Invoke-RgReport -OutputFile "legacy-fallbacks.txt" -Paths $reviewPaths -Pattern "legacy|fallback|compact|adaptive|ServerCompactPaintBatch|SendCustomStrokeBatchToServer|server_batch_limit|server_batch_delay|adaptive_batch|serverBatchLimit|adaptiveBatch"
+Invoke-RgReport -OutputFile "legacy-fallbacks.txt" -Paths $reviewPaths -Pattern "legacy|fallback|compact|adaptive|replication_pacing|ServerCompactPaintBatch|SendCustomStrokeBatchToServer|server_batch_limit|server_batch_delay|adaptive_batch|serverBatchLimit|adaptiveBatch"
 
-Invoke-RgReport -OutputFile "ui-native-command-surface.txt" -Paths $reviewPaths -Pattern 'chrome\.webview|WebMessageReceived|PostWebMessageAsJson|Invoke|command|type"\s*:\s*"|paint_full_route|cancel_paint|preview|unpreview|capabilities|diagnostic|ServerPackedPaintBatch|adaptive|serverBatch'
+Invoke-RgReport -OutputFile "ui-native-command-surface.txt" -Paths $reviewPaths -Pattern 'chrome\.webview|WebMessageReceived|PostWebMessageAsJson|Invoke|command|type"\s*:\s*"|paint_full_route|cancel_paint|preview|unpreview|capabilities|diagnostic|ServerPackedPaintBatch|replication_pacing|adaptive|serverBatch'
 
 $csprojRoot = Join-Path $RepoRoot "runtime/csharp"
 if (Test-Path $csprojRoot) {

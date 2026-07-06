@@ -184,14 +184,14 @@ Remaining intentional references:
 - event-watch can still observe old route names if the game calls them
 - review inventory still searches old route names as regression indicators
 
-## Candidate: Internal `adaptive_*` Names
+## Renamed: Internal `adaptive_*` Pacing Names
 
-Classification: `RENAME_CANDIDATE`, not dead code.
+Classification: `RENAMED`, not dead code.
 
 Evidence:
 
 - UI no longer lets users tune adaptive batching
-- bridge still uses these fields for packed-route pacing, queue gate, drain
+- bridge still uses this logic for packed-route pacing, queue gate, drain
   estimate, and progress text
 
 Risk:
@@ -200,10 +200,11 @@ Risk:
 
 Next action:
 
-- rename internal terms from `adaptive_*` to `replication_pacing_*` or
-  `packed_queue_gate_*`
-- keep JSON compatibility for progress parsing during the rename
-- do this as a behavior-preserving refactor after beta.3 stabilization
+- internal C++ and C# progress terms now use `replication_pacing_*` /
+  `ReplicationPacing*`
+- progress parsing keeps compatibility with old `adaptive_*` sidecar fields
+- remaining `adaptive` references are legacy request compatibility or game SDK
+  field names, not deletion candidates
 
 ## Candidate: Native Metadata Noise
 
@@ -241,10 +242,18 @@ These are active beta.3 behavior or high-risk infrastructure.
 
 ## Suggested Cleanup Order
 
-1. Decide whether WPF is supported. If not, remove/archive WPF first.
-2. Remove unused batch/adaptive localization keys after WPF is gone.
-3. Stop writing legacy batch/adaptive config keys while keeping read
+Completed in this cleanup pass:
+
+1. Removed unsupported WPF project files.
+2. Removed unused batch/adaptive localization keys.
+3. Stopped writing legacy batch/adaptive config keys while keeping read
    compatibility.
-4. Rename internal `adaptive_*` pacing names to packed replication pacing names.
-5. After multiplayer validation, remove old non-packed native paint RPC dispatch.
-6. Re-run `make review-dead-code` and update this document after each cleanup.
+4. Renamed packed replication pacing internals away from `adaptive_*`.
+
+Next:
+
+1. Re-run `make review-dead-code` and review generated artifacts.
+2. Smoke-test startup, preview/unpreview, cancel guards, and packed paint.
+3. Run release-precheck after multiplayer/live smoke is complete.
+4. After multiplayer validation, reassess old non-packed native paint RPC
+   dispatch references that remain only for diagnostics or research.

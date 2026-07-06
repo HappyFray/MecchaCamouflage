@@ -483,9 +483,9 @@ public sealed class HostSession
     private static string FormatBatch(ProgressSnapshot progress)
     {
         var effectiveBatch = EffectiveBatch(progress);
-        if (progress.AdaptiveBatchEnabled && effectiveBatch > 0)
+        if (progress.ReplicationPacingEnabled && effectiveBatch > 0)
         {
-            var max = progress.AdaptiveResolvedBatchLimit > 0 ? progress.AdaptiveResolvedBatchLimit : progress.AdaptiveRequestedBatchLimit;
+            var max = progress.ReplicationPacingResolvedBatchLimit > 0 ? progress.ReplicationPacingResolvedBatchLimit : progress.ReplicationPacingRequestedBatchLimit;
             return max > 0 ? $"{effectiveBatch}/{max}" : effectiveBatch.ToString(System.Globalization.CultureInfo.InvariantCulture);
         }
         var batch = effectiveBatch;
@@ -499,12 +499,12 @@ public sealed class HostSession
     }
 
     private static string TimingLabel(ProgressSnapshot progress) =>
-        progress.AdaptiveBatchEnabled ? "pacing" : "delay";
+        progress.ReplicationPacingEnabled ? "pacing" : "delay";
 
     private static int EffectiveBatch(ProgressSnapshot progress)
     {
-        if (progress.AdaptiveBatchEnabled && progress.AdaptiveBatchLimit > 0)
-            return progress.AdaptiveBatchLimit;
+        if (progress.ReplicationPacingEnabled && progress.ReplicationPacingBatchLimit > 0)
+            return progress.ReplicationPacingBatchLimit;
         if (progress.ServerBatchLimit > 0)
             return progress.ServerBatchLimit;
         return DefaultPackedBatchLimit;
@@ -512,8 +512,8 @@ public sealed class HostSession
 
     private static int EffectiveDelay(ProgressSnapshot progress)
     {
-        if (progress.AdaptiveBatchEnabled && progress.AdaptiveDelayMs > 0)
-            return progress.AdaptiveDelayMs;
+        if (progress.ReplicationPacingEnabled && progress.ReplicationPacingDelayMs > 0)
+            return progress.ReplicationPacingDelayMs;
         if (progress.ServerBatchDelayMs > 0)
             return progress.ServerBatchDelayMs;
         return DefaultPackedPacingMs;
@@ -524,11 +524,11 @@ public sealed class HostSession
         if (progress.ReplicationQueuedStrokeCount < 0)
             return "-";
         var strokes = progress.ReplicationQueuedStrokeCount == 1 ? "stroke" : "strokes";
-        if (progress.AdaptiveQueueDrainStrokesPerSec > 0.0 && double.IsFinite(progress.AdaptiveQueueDrainStrokesPerSec))
+        if (progress.ReplicationPacingQueueDrainStrokesPerSec > 0.0 && double.IsFinite(progress.ReplicationPacingQueueDrainStrokesPerSec))
         {
-            var drain = progress.AdaptiveQueueDrainStrokesPerSec >= 10.0
-                ? Math.Round(progress.AdaptiveQueueDrainStrokesPerSec).ToString(System.Globalization.CultureInfo.InvariantCulture)
-                : Math.Round(progress.AdaptiveQueueDrainStrokesPerSec, 1).ToString(System.Globalization.CultureInfo.InvariantCulture);
+            var drain = progress.ReplicationPacingQueueDrainStrokesPerSec >= 10.0
+                ? Math.Round(progress.ReplicationPacingQueueDrainStrokesPerSec).ToString(System.Globalization.CultureInfo.InvariantCulture)
+                : Math.Round(progress.ReplicationPacingQueueDrainStrokesPerSec, 1).ToString(System.Globalization.CultureInfo.InvariantCulture);
             return $"{progress.ReplicationQueuedStrokeCount} {strokes} (drain {drain}/s)";
         }
         return $"{progress.ReplicationQueuedStrokeCount} {strokes}";
@@ -789,17 +789,17 @@ public sealed class HostSession
                 Int(root, "server_batch_delay_ms", -1),
                 Number(root, "paint_eta_ms", -1.0),
                 Number(root, "paint_elapsed_ms", Number(root, "elapsed_ms", -1.0)),
-                Bool(root, "adaptive_batch_enabled", false),
-                Int(root, "adaptive_requested_batch_limit", -1),
-                Int(root, "adaptive_resolved_batch_limit", -1),
-                Int(root, "adaptive_requested_delay_ms", -1),
-                Int(root, "adaptive_batch_limit", -1),
-                Int(root, "adaptive_delay_ms", -1),
-                Text(root, "adaptive_pressure_level", "unknown"),
-                Int(root, "adaptive_backoff_count", 0),
-                Number(root, "adaptive_queue_drain_strokes_per_sec", -1.0),
-                Number(root, "adaptive_send_strokes_per_sec", -1.0),
-                Number(root, "adaptive_model_eta_ms", -1.0),
+                Bool(root, "replication_pacing_enabled", Bool(root, "adaptive_batch_enabled", false)),
+                Int(root, "replication_pacing_requested_batch_limit", Int(root, "adaptive_requested_batch_limit", -1)),
+                Int(root, "replication_pacing_resolved_batch_limit", Int(root, "adaptive_resolved_batch_limit", -1)),
+                Int(root, "replication_pacing_requested_delay_ms", Int(root, "adaptive_requested_delay_ms", -1)),
+                Int(root, "replication_pacing_batch_limit", Int(root, "adaptive_batch_limit", -1)),
+                Int(root, "replication_pacing_delay_ms", Int(root, "adaptive_delay_ms", -1)),
+                Text(root, "replication_pacing_pressure_level", Text(root, "adaptive_pressure_level", "unknown")),
+                Int(root, "replication_pacing_backoff_count", Int(root, "adaptive_backoff_count", 0)),
+                Number(root, "replication_pacing_queue_drain_strokes_per_sec", Number(root, "adaptive_queue_drain_strokes_per_sec", -1.0)),
+                Number(root, "replication_pacing_send_strokes_per_sec", Number(root, "adaptive_send_strokes_per_sec", -1.0)),
+                Number(root, "replication_pacing_model_eta_ms", Number(root, "adaptive_model_eta_ms", -1.0)),
                 Int(root, "replication_queued_batch_count", -1),
                 Int(root, "replication_queued_stroke_count", -1),
                 Int(root, "replication_max_strokes_per_tick", -1),

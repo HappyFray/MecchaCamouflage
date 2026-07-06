@@ -47,14 +47,14 @@ namespace
     constexpr int ProcessEventVtableIndex = 0x4C;
     constexpr int AutoEventWatchSampleBytes = 8192;
     constexpr UINT PaintDispatchMessage = WM_APP + 0x4D43;
-    constexpr int ServerPaintBatchStrokeLimit = 50;
-    constexpr int ServerPaintBatchStrokeLimitMax = 50;
-    constexpr int ServerPaintBatchDelayMs = 150;
-    constexpr int MeshFirstServerBatchMinDelayMs = 150;
-    constexpr int MeshFirstAdaptiveFallbackMaxStrokesPerTick = 24;
-    constexpr int MeshFirstAdaptiveFallbackMaxOutgoingStrokesPerBatch = 20;
-    constexpr int MeshFirstAdaptiveFallbackOutgoingBatchesPerSecond = 20;
-    constexpr int MeshFirstAdaptiveMaxDelayMs = 500;
+    constexpr int PackedReplicationDefaultBatchLimit = 50;
+    constexpr int PackedReplicationMaxBatchLimit = 50;
+    constexpr int PackedReplicationDefaultPacingMs = 150;
+    constexpr int PackedReplicationMinPacingMs = 150;
+    constexpr int PackedReplicationFallbackMaxStrokesPerTick = 24;
+    constexpr int PackedReplicationBatchSize = 20;
+    constexpr int PackedReplicationFallbackOutgoingBatchesPerSecond = 20;
+    constexpr int PackedReplicationMaxPacingMs = 500;
     constexpr int MeshFirstFastApplyStrokesPerTick = 0;
     constexpr int MeshFirstFastApplyRenderTargetWritesPerFrame = 0;
     constexpr int MeshFirstServerTextureSyncPollMs = 50;
@@ -524,23 +524,23 @@ namespace
                  "server_packed_paint_batch_used",
                  "server_packed_paint_batch_route",
                  "server_packed_paint_batch_ignored",
-                 "adaptive_batch_enabled",
-                 "adaptive_requested_batch_limit",
-                 "adaptive_resolved_batch_limit",
-                 "adaptive_requested_delay_ms",
-                 "adaptive_resolved_pacing_ms",
-                 "adaptive_batch_limit",
-                 "adaptive_delay_ms",
-                 "adaptive_max_outgoing_strokes_per_batch",
-                 "adaptive_max_outgoing_network_batches_per_second",
-                 "adaptive_pressure_level",
-                 "adaptive_backoff_count",
-                 "adaptive_queue_wait_count",
-                 "adaptive_queue_gate_limit",
-                 "adaptive_batch_queue_gate_limit",
-                 "adaptive_queue_drain_strokes_per_sec",
-                 "adaptive_send_strokes_per_sec",
-                 "adaptive_model_eta_ms",
+                 "replication_pacing_enabled",
+                 "replication_pacing_requested_batch_limit",
+                 "replication_pacing_resolved_batch_limit",
+                 "replication_pacing_requested_delay_ms",
+                 "replication_pacing_resolved_pacing_ms",
+                 "replication_pacing_batch_limit",
+                 "replication_pacing_delay_ms",
+                 "replication_pacing_max_outgoing_strokes_per_batch",
+                 "replication_pacing_max_outgoing_network_batches_per_second",
+                 "replication_pacing_pressure_level",
+                 "replication_pacing_backoff_count",
+                 "replication_pacing_queue_wait_count",
+                 "replication_pacing_queue_gate_limit",
+                 "replication_pacing_batch_queue_gate_limit",
+                 "replication_pacing_queue_drain_strokes_per_sec",
+                 "replication_pacing_send_strokes_per_sec",
+                 "replication_pacing_model_eta_ms",
                  "replication_queued_batch_count",
                  "replication_queued_stroke_count",
                  "replication_max_strokes_per_tick",
@@ -595,23 +595,23 @@ namespace
                  "first_failure",
                  "remaining_strokes",
                  "cancel_phase",
-                 "adaptive_batch_enabled",
-                 "adaptive_requested_batch_limit",
-                 "adaptive_resolved_batch_limit",
-                 "adaptive_requested_delay_ms",
-                 "adaptive_resolved_pacing_ms",
-                 "adaptive_batch_limit",
-                 "adaptive_delay_ms",
-                 "adaptive_max_outgoing_strokes_per_batch",
-                 "adaptive_max_outgoing_network_batches_per_second",
-                 "adaptive_pressure_level",
-                 "adaptive_backoff_count",
-                 "adaptive_queue_wait_count",
-                 "adaptive_queue_gate_limit",
-                 "adaptive_batch_queue_gate_limit",
-                 "adaptive_queue_drain_strokes_per_sec",
-                 "adaptive_send_strokes_per_sec",
-                 "adaptive_model_eta_ms",
+                 "replication_pacing_enabled",
+                 "replication_pacing_requested_batch_limit",
+                 "replication_pacing_resolved_batch_limit",
+                 "replication_pacing_requested_delay_ms",
+                 "replication_pacing_resolved_pacing_ms",
+                 "replication_pacing_batch_limit",
+                 "replication_pacing_delay_ms",
+                 "replication_pacing_max_outgoing_strokes_per_batch",
+                 "replication_pacing_max_outgoing_network_batches_per_second",
+                 "replication_pacing_pressure_level",
+                 "replication_pacing_backoff_count",
+                 "replication_pacing_queue_wait_count",
+                 "replication_pacing_queue_gate_limit",
+                 "replication_pacing_batch_queue_gate_limit",
+                 "replication_pacing_queue_drain_strokes_per_sec",
+                 "replication_pacing_send_strokes_per_sec",
+                 "replication_pacing_model_eta_ms",
                  "replication_queued_batch_count",
                  "replication_queued_stroke_count",
                  "replication_max_strokes_per_tick",
@@ -8471,7 +8471,7 @@ namespace
             limit = limit > 0 ? std::min(limit, snapshot.manager_max_replicated_strokes_per_tick)
                               : snapshot.manager_max_replicated_strokes_per_tick;
         }
-        return limit > 0 ? limit : MeshFirstAdaptiveFallbackMaxStrokesPerTick;
+        return limit > 0 ? limit : PackedReplicationFallbackMaxStrokesPerTick;
     }
 
     auto mesh_first_pressure_max_outgoing_strokes_per_batch(const MeshFirstReplicationSnapshot& snapshot) -> int
@@ -8480,7 +8480,7 @@ namespace
         {
             return snapshot.manager_max_outgoing_strokes_per_batch;
         }
-        return MeshFirstAdaptiveFallbackMaxOutgoingStrokesPerBatch;
+        return PackedReplicationBatchSize;
     }
 
     auto mesh_first_pressure_outgoing_batches_per_second(const MeshFirstReplicationSnapshot& snapshot) -> int
@@ -8489,7 +8489,7 @@ namespace
         {
             return snapshot.manager_max_outgoing_network_batches_per_second;
         }
-        return MeshFirstAdaptiveFallbackOutgoingBatchesPerSecond;
+        return PackedReplicationFallbackOutgoingBatchesPerSecond;
     }
 
     auto mesh_first_compact_replication_enabled(const MeshFirstReplicationSnapshot& snapshot) -> bool
@@ -8532,7 +8532,7 @@ namespace
         return -1.0;
     }
 
-    enum class MeshFirstAdaptivePressureLevel
+    enum class MeshFirstReplicationPacingPressureLevel
     {
         Unknown,
         Low,
@@ -8541,19 +8541,19 @@ namespace
         Critical
     };
 
-    auto mesh_first_adaptive_pressure_level_name(MeshFirstAdaptivePressureLevel level) -> const char*
+    auto mesh_first_replication_pacing_pressure_level_name(MeshFirstReplicationPacingPressureLevel level) -> const char*
     {
         switch (level)
         {
-        case MeshFirstAdaptivePressureLevel::Low:
+        case MeshFirstReplicationPacingPressureLevel::Low:
             return "low";
-        case MeshFirstAdaptivePressureLevel::Moderate:
+        case MeshFirstReplicationPacingPressureLevel::Moderate:
             return "moderate";
-        case MeshFirstAdaptivePressureLevel::High:
+        case MeshFirstReplicationPacingPressureLevel::High:
             return "high";
-        case MeshFirstAdaptivePressureLevel::Critical:
+        case MeshFirstReplicationPacingPressureLevel::Critical:
             return "critical";
-        case MeshFirstAdaptivePressureLevel::Unknown:
+        case MeshFirstReplicationPacingPressureLevel::Unknown:
         default:
             return "unknown";
         }
@@ -8598,30 +8598,30 @@ namespace
         MeshFirstChannelChecksum albedo_before{};
         std::vector<std::uint8_t> albedo_before_bytes{};
         MeshFirstReplicationSnapshot replication_before{};
-        int server_batch_limit{ServerPaintBatchStrokeLimit};
-        int server_batch_delay_ms{ServerPaintBatchDelayMs};
-        int local_visual_sync_batch_limit{ServerPaintBatchStrokeLimit};
-        int local_visual_sync_delay_ms{ServerPaintBatchDelayMs};
-        bool adaptive_batch_enabled{true};
-        int adaptive_requested_batch_limit{ServerPaintBatchStrokeLimit};
-        int adaptive_resolved_batch_limit{ServerPaintBatchStrokeLimit};
-        int adaptive_requested_delay_ms{ServerPaintBatchDelayMs};
-        int adaptive_resolved_pacing_ms{ServerPaintBatchDelayMs};
-        int adaptive_resolved_outgoing_strokes_per_batch{-1};
-        int adaptive_resolved_outgoing_batches_per_second{-1};
-        int adaptive_backoff_count{0};
-        std::string adaptive_pressure_level{"unknown"};
-        MeshFirstReplicationSnapshot adaptive_pre_pressure{};
-        MeshFirstReplicationSnapshot adaptive_post_pressure{};
-        double adaptive_last_rpc_ms{0.0};
-        double adaptive_last_timer_drift_ms{0.0};
-        bool adaptive_model_sample_valid{false};
-        std::chrono::steady_clock::time_point adaptive_model_sample_at{};
-        int adaptive_model_sample_sent{0};
-        int adaptive_model_sample_queue{0};
-        double adaptive_queue_drain_strokes_per_ms{-1.0};
-        double adaptive_send_strokes_per_ms{-1.0};
-        double adaptive_model_eta_ms{-1.0};
+        int server_batch_limit{PackedReplicationDefaultBatchLimit};
+        int server_batch_delay_ms{PackedReplicationDefaultPacingMs};
+        int local_visual_sync_batch_limit{PackedReplicationDefaultBatchLimit};
+        int local_visual_sync_delay_ms{PackedReplicationDefaultPacingMs};
+        bool replication_pacing_enabled{true};
+        int replication_pacing_requested_batch_limit{PackedReplicationDefaultBatchLimit};
+        int replication_pacing_resolved_batch_limit{PackedReplicationDefaultBatchLimit};
+        int replication_pacing_requested_delay_ms{PackedReplicationDefaultPacingMs};
+        int replication_pacing_resolved_pacing_ms{PackedReplicationDefaultPacingMs};
+        int replication_pacing_resolved_outgoing_strokes_per_batch{-1};
+        int replication_pacing_resolved_outgoing_batches_per_second{-1};
+        int replication_pacing_backoff_count{0};
+        std::string replication_pacing_pressure_level{"unknown"};
+        MeshFirstReplicationSnapshot replication_pacing_pre_pressure{};
+        MeshFirstReplicationSnapshot replication_pacing_post_pressure{};
+        double replication_pacing_last_rpc_ms{0.0};
+        double replication_pacing_last_timer_drift_ms{0.0};
+        bool replication_pacing_model_sample_valid{false};
+        std::chrono::steady_clock::time_point replication_pacing_model_sample_at{};
+        int replication_pacing_model_sample_sent{0};
+        int replication_pacing_model_sample_queue{0};
+        double replication_pacing_queue_drain_strokes_per_ms{-1.0};
+        double replication_pacing_send_strokes_per_ms{-1.0};
+        double replication_pacing_model_eta_ms{-1.0};
         std::uintptr_t replication_manager{0};
         std::uintptr_t replication_recorded_count_function{0};
         std::uintptr_t replication_queued_count_function{0};
@@ -8831,54 +8831,54 @@ namespace
         return snapshot;
     }
 
-    auto mesh_first_adaptive_requested_delay(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job) -> int
+    auto mesh_first_replication_pacing_requested_delay(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job) -> int
     {
-        return std::clamp(job ? job->adaptive_requested_delay_ms : ServerPaintBatchDelayMs,
-                          MeshFirstServerBatchMinDelayMs,
-                          MeshFirstAdaptiveMaxDelayMs);
+        return std::clamp(job ? job->replication_pacing_requested_delay_ms : PackedReplicationDefaultPacingMs,
+                          PackedReplicationMinPacingMs,
+                          PackedReplicationMaxPacingMs);
     }
 
-    auto mesh_first_adaptive_requested_batch(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job) -> int
+    auto mesh_first_replication_pacing_requested_batch(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job) -> int
     {
-        return std::max(1, job ? job->adaptive_requested_batch_limit : ServerPaintBatchStrokeLimit);
+        return std::max(1, job ? job->replication_pacing_requested_batch_limit : PackedReplicationDefaultBatchLimit);
     }
 
-    auto mesh_first_adaptive_resolved_batch(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job) -> int
+    auto mesh_first_replication_pacing_resolved_batch(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job) -> int
     {
-        const int requested = mesh_first_adaptive_requested_batch(job);
-        if (!job || !job->adaptive_batch_enabled)
+        const int requested = mesh_first_replication_pacing_requested_batch(job);
+        if (!job || !job->replication_pacing_enabled)
         {
             return requested;
         }
-        const int resolved = job->adaptive_resolved_batch_limit > 0
-                                 ? job->adaptive_resolved_batch_limit
-                                 : std::min(requested, MeshFirstAdaptiveFallbackMaxStrokesPerTick);
+        const int resolved = job->replication_pacing_resolved_batch_limit > 0
+                                 ? job->replication_pacing_resolved_batch_limit
+                                 : std::min(requested, PackedReplicationFallbackMaxStrokesPerTick);
         return std::clamp(resolved, 1, requested);
     }
 
-    auto mesh_first_adaptive_resolved_pacing(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job) -> int
+    auto mesh_first_replication_pacing_resolved_pacing(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job) -> int
     {
-        if (!job || !job->adaptive_batch_enabled)
+        if (!job || !job->replication_pacing_enabled)
         {
-            return mesh_first_adaptive_requested_delay(job);
+            return mesh_first_replication_pacing_requested_delay(job);
         }
-        if (job->adaptive_resolved_pacing_ms > 0)
+        if (job->replication_pacing_resolved_pacing_ms > 0)
         {
-            return std::clamp(job->adaptive_resolved_pacing_ms, 1, MeshFirstAdaptiveMaxDelayMs);
+            return std::clamp(job->replication_pacing_resolved_pacing_ms, 1, PackedReplicationMaxPacingMs);
         }
         const int fallback = static_cast<int>(
-            std::ceil(1000.0 / static_cast<double>(std::max(1, MeshFirstAdaptiveFallbackOutgoingBatchesPerSecond))));
-        return std::clamp(fallback, 1, MeshFirstAdaptiveMaxDelayMs);
+            std::ceil(1000.0 / static_cast<double>(std::max(1, PackedReplicationFallbackOutgoingBatchesPerSecond))));
+        return std::clamp(fallback, 1, PackedReplicationMaxPacingMs);
     }
 
-    void mesh_first_update_adaptive_resolved_batch(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job,
+    void mesh_first_update_replication_pacing_resolved_batch(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job,
                                                    const MeshFirstReplicationSnapshot& pressure)
     {
-        if (!job || !job->adaptive_batch_enabled)
+        if (!job || !job->replication_pacing_enabled)
         {
             return;
         }
-        const int requested = mesh_first_adaptive_requested_batch(job);
+        const int requested = mesh_first_replication_pacing_requested_batch(job);
         const int max_strokes_per_tick = mesh_first_pressure_max_strokes_per_tick(pressure);
         const int max_outgoing_strokes_per_batch = mesh_first_pressure_max_outgoing_strokes_per_batch(pressure);
         const int outgoing_batches_per_second = mesh_first_pressure_outgoing_batches_per_second(pressure);
@@ -8891,32 +8891,32 @@ namespace
         {
             resolved = std::min(resolved, max_outgoing_strokes_per_batch);
         }
-        job->adaptive_resolved_batch_limit = std::clamp(resolved, 1, requested);
-        job->adaptive_resolved_outgoing_strokes_per_batch = max_outgoing_strokes_per_batch;
-        job->adaptive_resolved_outgoing_batches_per_second = outgoing_batches_per_second;
+        job->replication_pacing_resolved_batch_limit = std::clamp(resolved, 1, requested);
+        job->replication_pacing_resolved_outgoing_strokes_per_batch = max_outgoing_strokes_per_batch;
+        job->replication_pacing_resolved_outgoing_batches_per_second = outgoing_batches_per_second;
         const int pacing = outgoing_batches_per_second > 0
                                ? static_cast<int>(std::ceil(1000.0 / static_cast<double>(outgoing_batches_per_second)))
-                               : static_cast<int>(std::ceil(1000.0 / static_cast<double>(MeshFirstAdaptiveFallbackOutgoingBatchesPerSecond)));
-        job->adaptive_resolved_pacing_ms = std::clamp(pacing, 1, MeshFirstAdaptiveMaxDelayMs);
-        if (job->server_batch_limit > job->adaptive_resolved_batch_limit)
+                               : static_cast<int>(std::ceil(1000.0 / static_cast<double>(PackedReplicationFallbackOutgoingBatchesPerSecond)));
+        job->replication_pacing_resolved_pacing_ms = std::clamp(pacing, 1, PackedReplicationMaxPacingMs);
+        if (job->server_batch_limit > job->replication_pacing_resolved_batch_limit)
         {
-            job->server_batch_limit = job->adaptive_resolved_batch_limit;
+            job->server_batch_limit = job->replication_pacing_resolved_batch_limit;
             job->local_visual_sync_batch_limit = job->server_batch_limit;
         }
     }
 
-    auto mesh_first_adaptive_clamp_batch(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job, int value) -> int
+    auto mesh_first_replication_pacing_clamp_batch(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job, int value) -> int
     {
-        return std::clamp(value, 1, mesh_first_adaptive_resolved_batch(job));
+        return std::clamp(value, 1, mesh_first_replication_pacing_resolved_batch(job));
     }
 
-    auto mesh_first_adaptive_clamp_delay(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job, int value) -> int
+    auto mesh_first_replication_pacing_clamp_delay(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job, int value) -> int
     {
         (void)value;
-        return mesh_first_adaptive_resolved_pacing(job);
+        return mesh_first_replication_pacing_resolved_pacing(job);
     }
 
-    void mesh_first_set_adaptive_effective(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job,
+    void mesh_first_set_replication_pacing_effective(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job,
                                            int batch_limit,
                                            int delay_ms)
     {
@@ -8924,22 +8924,22 @@ namespace
         {
             return;
         }
-        job->server_batch_limit = mesh_first_adaptive_clamp_batch(job, batch_limit);
-        job->server_batch_delay_ms = mesh_first_adaptive_clamp_delay(job, delay_ms);
+        job->server_batch_limit = mesh_first_replication_pacing_clamp_batch(job, batch_limit);
+        job->server_batch_delay_ms = mesh_first_replication_pacing_clamp_delay(job, delay_ms);
         job->local_visual_sync_batch_limit = job->server_batch_limit;
         job->local_visual_sync_delay_ms = job->server_batch_delay_ms;
     }
 
-    auto mesh_first_adaptive_latest_pressure(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job)
+    auto mesh_first_replication_pacing_latest_pressure(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job)
         -> const MeshFirstReplicationSnapshot&
     {
-        if (job && mesh_first_has_replication_pressure_signal(job->adaptive_post_pressure))
+        if (job && mesh_first_has_replication_pressure_signal(job->replication_pacing_post_pressure))
         {
-            return job->adaptive_post_pressure;
+            return job->replication_pacing_post_pressure;
         }
-        if (job && mesh_first_has_replication_pressure_signal(job->adaptive_pre_pressure))
+        if (job && mesh_first_has_replication_pressure_signal(job->replication_pacing_pre_pressure))
         {
-            return job->adaptive_pre_pressure;
+            return job->replication_pacing_pre_pressure;
         }
         if (job)
         {
@@ -8949,7 +8949,7 @@ namespace
         return empty;
     }
 
-    void mesh_first_update_adaptive_model(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job,
+    void mesh_first_update_replication_pacing_model(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job,
                                           const MeshFirstReplicationSnapshot& pressure)
     {
         if (!job)
@@ -8963,25 +8963,25 @@ namespace
         }
 
         const auto now = std::chrono::steady_clock::now();
-        if (!job->adaptive_model_sample_valid ||
-            job->adaptive_model_sample_at.time_since_epoch().count() == 0)
+        if (!job->replication_pacing_model_sample_valid ||
+            job->replication_pacing_model_sample_at.time_since_epoch().count() == 0)
         {
-            job->adaptive_model_sample_valid = true;
-            job->adaptive_model_sample_at = now;
-            job->adaptive_model_sample_sent = std::max(0, job->server_strokes_sent);
-            job->adaptive_model_sample_queue = queue;
+            job->replication_pacing_model_sample_valid = true;
+            job->replication_pacing_model_sample_at = now;
+            job->replication_pacing_model_sample_sent = std::max(0, job->server_strokes_sent);
+            job->replication_pacing_model_sample_queue = queue;
             return;
         }
 
         const double delta_ms =
-            std::chrono::duration<double, std::milli>(now - job->adaptive_model_sample_at).count();
+            std::chrono::duration<double, std::milli>(now - job->replication_pacing_model_sample_at).count();
         if (delta_ms < 250.0 || !std::isfinite(delta_ms))
         {
             return;
         }
 
-        const int sent_delta = std::max(0, job->server_strokes_sent - job->adaptive_model_sample_sent);
-        const int drained = std::max(0, job->adaptive_model_sample_queue + sent_delta - queue);
+        const int sent_delta = std::max(0, job->server_strokes_sent - job->replication_pacing_model_sample_sent);
+        const int drained = std::max(0, job->replication_pacing_model_sample_queue + sent_delta - queue);
         auto update_rate = [](double& target, double sample) {
             if (!std::isfinite(sample) || sample <= 0.0)
             {
@@ -8989,32 +8989,32 @@ namespace
             }
             target = target <= 0.0 ? sample : (target * 0.70) + (sample * 0.30);
         };
-        update_rate(job->adaptive_queue_drain_strokes_per_ms,
+        update_rate(job->replication_pacing_queue_drain_strokes_per_ms,
                     static_cast<double>(drained) / delta_ms);
-        update_rate(job->adaptive_send_strokes_per_ms,
+        update_rate(job->replication_pacing_send_strokes_per_ms,
                     static_cast<double>(sent_delta) / delta_ms);
 
-        job->adaptive_model_sample_valid = true;
-        job->adaptive_model_sample_at = now;
-        job->adaptive_model_sample_sent = std::max(0, job->server_strokes_sent);
-        job->adaptive_model_sample_queue = queue;
+        job->replication_pacing_model_sample_valid = true;
+        job->replication_pacing_model_sample_at = now;
+        job->replication_pacing_model_sample_sent = std::max(0, job->server_strokes_sent);
+        job->replication_pacing_model_sample_queue = queue;
     }
 
-    auto mesh_first_adaptive_queue_gate_limit(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job) -> int
+    auto mesh_first_replication_pacing_queue_gate_limit(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job) -> int
     {
-        return std::max(1, mesh_first_adaptive_resolved_batch(job));
+        return std::max(1, mesh_first_replication_pacing_resolved_batch(job));
     }
 
-    auto mesh_first_adaptive_batch_queue_gate_limit(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job) -> int
+    auto mesh_first_replication_pacing_batch_queue_gate_limit(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job) -> int
     {
         const int outgoing_batches_per_second =
-            job && job->adaptive_resolved_outgoing_batches_per_second > 0
-                ? job->adaptive_resolved_outgoing_batches_per_second
-                : MeshFirstAdaptiveFallbackOutgoingBatchesPerSecond;
+            job && job->replication_pacing_resolved_outgoing_batches_per_second > 0
+                ? job->replication_pacing_resolved_outgoing_batches_per_second
+                : PackedReplicationFallbackOutgoingBatchesPerSecond;
         return std::max(1, outgoing_batches_per_second * 2);
     }
 
-    auto mesh_first_adaptive_queue_gate_open(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job,
+    auto mesh_first_replication_pacing_queue_gate_open(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job,
                                              const MeshFirstReplicationSnapshot& pressure) -> bool
     {
         const int queued_strokes = mesh_first_pressure_queued_stroke_count(pressure);
@@ -9024,81 +9024,81 @@ namespace
             return true;
         }
         const bool strokes_ok = queued_strokes < 0 ||
-                                queued_strokes <= mesh_first_adaptive_queue_gate_limit(job);
+                                queued_strokes <= mesh_first_replication_pacing_queue_gate_limit(job);
         const bool batches_ok = queued_batches < 0 ||
-                                queued_batches <= mesh_first_adaptive_batch_queue_gate_limit(job);
+                                queued_batches <= mesh_first_replication_pacing_batch_queue_gate_limit(job);
         return strokes_ok && batches_ok;
     }
 
-    auto mesh_first_adaptive_queue_gate_pressure_level(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job,
+    auto mesh_first_replication_pacing_queue_gate_pressure_level(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job,
                                                        const MeshFirstReplicationSnapshot& pressure)
-        -> MeshFirstAdaptivePressureLevel
+        -> MeshFirstReplicationPacingPressureLevel
     {
         if (!mesh_first_has_replication_pressure_signal(pressure))
         {
-            return MeshFirstAdaptivePressureLevel::Unknown;
+            return MeshFirstReplicationPacingPressureLevel::Unknown;
         }
         const int queued_strokes = mesh_first_pressure_queued_stroke_count(pressure);
         const int queued_batches = mesh_first_pressure_queued_batch_count(pressure);
         if (queued_strokes < 0 && queued_batches < 0)
         {
-            return MeshFirstAdaptivePressureLevel::Unknown;
+            return MeshFirstReplicationPacingPressureLevel::Unknown;
         }
-        const int stroke_gate = mesh_first_adaptive_queue_gate_limit(job);
-        const int batch_gate = mesh_first_adaptive_batch_queue_gate_limit(job);
+        const int stroke_gate = mesh_first_replication_pacing_queue_gate_limit(job);
+        const int batch_gate = mesh_first_replication_pacing_batch_queue_gate_limit(job);
         const int stroke_pressure = queued_strokes < 0 ? 0 : (queued_strokes + stroke_gate - 1) / stroke_gate;
         const int batch_pressure = queued_batches < 0 ? 0 : (queued_batches + batch_gate - 1) / batch_gate;
         const int pressure_ratio = std::max(stroke_pressure, batch_pressure);
         if (pressure_ratio <= 1)
         {
-            return MeshFirstAdaptivePressureLevel::Low;
+            return MeshFirstReplicationPacingPressureLevel::Low;
         }
         if (pressure_ratio <= 2)
         {
-            return MeshFirstAdaptivePressureLevel::Moderate;
+            return MeshFirstReplicationPacingPressureLevel::Moderate;
         }
         if (pressure_ratio <= 4)
         {
-            return MeshFirstAdaptivePressureLevel::High;
+            return MeshFirstReplicationPacingPressureLevel::High;
         }
-        return MeshFirstAdaptivePressureLevel::Critical;
+        return MeshFirstReplicationPacingPressureLevel::Critical;
     }
 
-    auto mesh_first_adaptive_metadata(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job) -> std::string
+    auto mesh_first_replication_pacing_metadata(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job) -> std::string
     {
-        const auto& pressure = mesh_first_adaptive_latest_pressure(job);
+        const auto& pressure = mesh_first_replication_pacing_latest_pressure(job);
         std::string out{};
-        out += ",\"adaptive_batch_enabled\":" + std::string(json_bool(job && job->adaptive_batch_enabled));
-        out += ",\"adaptive_requested_batch_limit\":" +
-               std::to_string(mesh_first_adaptive_requested_batch(job));
-        out += ",\"adaptive_resolved_batch_limit\":" +
-               std::to_string(mesh_first_adaptive_resolved_batch(job));
-        out += ",\"adaptive_requested_delay_ms\":" +
-               std::to_string(job ? mesh_first_adaptive_requested_delay(job) : ServerPaintBatchDelayMs);
-        out += ",\"adaptive_resolved_pacing_ms\":" +
-               std::to_string(job ? mesh_first_adaptive_resolved_pacing(job) : ServerPaintBatchDelayMs);
-        out += ",\"adaptive_batch_limit\":" + std::to_string(job ? std::max(1, job->server_batch_limit) : ServerPaintBatchStrokeLimit);
-        out += ",\"adaptive_delay_ms\":" + std::to_string(job ? std::max(0, job->server_batch_delay_ms) : ServerPaintBatchDelayMs);
-        out += ",\"adaptive_pressure_level\":\"" + json_escape(job ? job->adaptive_pressure_level : "unknown") + "\"";
-        out += ",\"adaptive_backoff_count\":" + std::to_string(job ? job->adaptive_backoff_count : 0);
-        out += ",\"adaptive_queue_wait_count\":" + std::to_string(job ? job->adaptive_backoff_count : 0);
-        out += ",\"adaptive_queue_gate_limit\":" + std::to_string(mesh_first_adaptive_queue_gate_limit(job));
-        out += ",\"adaptive_batch_queue_gate_limit\":" +
-               std::to_string(mesh_first_adaptive_batch_queue_gate_limit(job));
-        out += ",\"adaptive_max_outgoing_strokes_per_batch\":" +
-               std::to_string(job ? job->adaptive_resolved_outgoing_strokes_per_batch : -1);
-        out += ",\"adaptive_max_outgoing_network_batches_per_second\":" +
-               std::to_string(job ? job->adaptive_resolved_outgoing_batches_per_second : -1);
-        out += ",\"adaptive_queue_drain_strokes_per_sec\":" +
-               std::to_string(job && job->adaptive_queue_drain_strokes_per_ms > 0.0
-                                  ? job->adaptive_queue_drain_strokes_per_ms * 1000.0
+        out += ",\"replication_pacing_enabled\":" + std::string(json_bool(job && job->replication_pacing_enabled));
+        out += ",\"replication_pacing_requested_batch_limit\":" +
+               std::to_string(mesh_first_replication_pacing_requested_batch(job));
+        out += ",\"replication_pacing_resolved_batch_limit\":" +
+               std::to_string(mesh_first_replication_pacing_resolved_batch(job));
+        out += ",\"replication_pacing_requested_delay_ms\":" +
+               std::to_string(job ? mesh_first_replication_pacing_requested_delay(job) : PackedReplicationDefaultPacingMs);
+        out += ",\"replication_pacing_resolved_pacing_ms\":" +
+               std::to_string(job ? mesh_first_replication_pacing_resolved_pacing(job) : PackedReplicationDefaultPacingMs);
+        out += ",\"replication_pacing_batch_limit\":" + std::to_string(job ? std::max(1, job->server_batch_limit) : PackedReplicationDefaultBatchLimit);
+        out += ",\"replication_pacing_delay_ms\":" + std::to_string(job ? std::max(0, job->server_batch_delay_ms) : PackedReplicationDefaultPacingMs);
+        out += ",\"replication_pacing_pressure_level\":\"" + json_escape(job ? job->replication_pacing_pressure_level : "unknown") + "\"";
+        out += ",\"replication_pacing_backoff_count\":" + std::to_string(job ? job->replication_pacing_backoff_count : 0);
+        out += ",\"replication_pacing_queue_wait_count\":" + std::to_string(job ? job->replication_pacing_backoff_count : 0);
+        out += ",\"replication_pacing_queue_gate_limit\":" + std::to_string(mesh_first_replication_pacing_queue_gate_limit(job));
+        out += ",\"replication_pacing_batch_queue_gate_limit\":" +
+               std::to_string(mesh_first_replication_pacing_batch_queue_gate_limit(job));
+        out += ",\"replication_pacing_max_outgoing_strokes_per_batch\":" +
+               std::to_string(job ? job->replication_pacing_resolved_outgoing_strokes_per_batch : -1);
+        out += ",\"replication_pacing_max_outgoing_network_batches_per_second\":" +
+               std::to_string(job ? job->replication_pacing_resolved_outgoing_batches_per_second : -1);
+        out += ",\"replication_pacing_queue_drain_strokes_per_sec\":" +
+               std::to_string(job && job->replication_pacing_queue_drain_strokes_per_ms > 0.0
+                                  ? job->replication_pacing_queue_drain_strokes_per_ms * 1000.0
                                   : -1.0);
-        out += ",\"adaptive_send_strokes_per_sec\":" +
-               std::to_string(job && job->adaptive_send_strokes_per_ms > 0.0
-                                  ? job->adaptive_send_strokes_per_ms * 1000.0
+        out += ",\"replication_pacing_send_strokes_per_sec\":" +
+               std::to_string(job && job->replication_pacing_send_strokes_per_ms > 0.0
+                                  ? job->replication_pacing_send_strokes_per_ms * 1000.0
                                   : -1.0);
-        out += ",\"adaptive_model_eta_ms\":" +
-               std::to_string(job && job->adaptive_model_eta_ms >= 0.0 ? job->adaptive_model_eta_ms : -1.0);
+        out += ",\"replication_pacing_model_eta_ms\":" +
+               std::to_string(job && job->replication_pacing_model_eta_ms >= 0.0 ? job->replication_pacing_model_eta_ms : -1.0);
         out += ",\"replication_queued_batch_count\":" + std::to_string(mesh_first_pressure_queued_batch_count(pressure));
         out += ",\"replication_queued_stroke_count\":" + std::to_string(mesh_first_pressure_queued_stroke_count(pressure));
         out += ",\"replication_max_strokes_per_tick\":" +
@@ -9115,10 +9115,10 @@ namespace
                std::to_string(pressure.manager_max_outgoing_network_batches_per_second);
         if (job && metadata_contains_bool(job->metadata, "research_artifacts_requested", true))
         {
-            out += ",\"adaptive_last_rpc_ms\":" + std::to_string(job->adaptive_last_rpc_ms);
-            out += ",\"adaptive_last_timer_drift_ms\":" + std::to_string(job->adaptive_last_timer_drift_ms);
-            out += mesh_first_replication_snapshot_metadata("adaptive_pre_pressure", job->adaptive_pre_pressure);
-            out += mesh_first_replication_snapshot_metadata("adaptive_post_pressure", job->adaptive_post_pressure);
+            out += ",\"replication_pacing_last_rpc_ms\":" + std::to_string(job->replication_pacing_last_rpc_ms);
+            out += ",\"replication_pacing_last_timer_drift_ms\":" + std::to_string(job->replication_pacing_last_timer_drift_ms);
+            out += mesh_first_replication_snapshot_metadata("replication_pacing_pre_pressure", job->replication_pacing_pre_pressure);
+            out += mesh_first_replication_snapshot_metadata("replication_pacing_post_pressure", job->replication_pacing_post_pressure);
         }
         return out;
     }
@@ -9276,7 +9276,7 @@ namespace
         {
             if (job)
             {
-                job->adaptive_model_eta_ms = 0.0;
+                job->replication_pacing_model_eta_ms = 0.0;
             }
             return 0.0;
         }
@@ -9286,32 +9286,32 @@ namespace
             static_cast<double>(std::max(0, server_batch_delay_ms));
         double raw_eta_ms = scheduled_send_ms;
 
-        if (job && job->adaptive_batch_enabled)
+        if (job && job->replication_pacing_enabled)
         {
-            const auto& pressure = mesh_first_adaptive_latest_pressure(job);
+            const auto& pressure = mesh_first_replication_pacing_latest_pressure(job);
             const int queued_strokes = mesh_first_pressure_queued_stroke_count(pressure);
             const bool drain_rate_available =
-                job->adaptive_queue_drain_strokes_per_ms > 0.0 &&
-                std::isfinite(job->adaptive_queue_drain_strokes_per_ms);
-            if (queued_strokes > mesh_first_adaptive_queue_gate_limit(job) && !drain_rate_available)
+                job->replication_pacing_queue_drain_strokes_per_ms > 0.0 &&
+                std::isfinite(job->replication_pacing_queue_drain_strokes_per_ms);
+            if (queued_strokes > mesh_first_replication_pacing_queue_gate_limit(job) && !drain_rate_available)
             {
-                job->adaptive_model_eta_ms = -1.0;
+                job->replication_pacing_model_eta_ms = -1.0;
                 return -1.0;
             }
         }
 
-        if (job && job->adaptive_send_strokes_per_ms > 0.0 &&
-            std::isfinite(job->adaptive_send_strokes_per_ms))
+        if (job && job->replication_pacing_send_strokes_per_ms > 0.0 &&
+            std::isfinite(job->replication_pacing_send_strokes_per_ms))
         {
             raw_eta_ms = std::max(raw_eta_ms,
                                   static_cast<double>(remaining_server_strokes) /
-                                      job->adaptive_send_strokes_per_ms);
+                                      job->replication_pacing_send_strokes_per_ms);
         }
 
-        if (job && job->adaptive_queue_drain_strokes_per_ms > 0.0 &&
-            std::isfinite(job->adaptive_queue_drain_strokes_per_ms))
+        if (job && job->replication_pacing_queue_drain_strokes_per_ms > 0.0 &&
+            std::isfinite(job->replication_pacing_queue_drain_strokes_per_ms))
         {
-            const auto& pressure = mesh_first_adaptive_latest_pressure(job);
+            const auto& pressure = mesh_first_replication_pacing_latest_pressure(job);
             const int queued_strokes = mesh_first_pressure_queued_stroke_count(pressure);
             if (queued_strokes >= 0)
             {
@@ -9319,7 +9319,7 @@ namespace
                     std::max(0, queued_strokes + std::max(0, remaining_server_strokes));
                 raw_eta_ms = std::max(raw_eta_ms,
                                       static_cast<double>(expected_queue_after_sends) /
-                                          job->adaptive_queue_drain_strokes_per_ms);
+                                          job->replication_pacing_queue_drain_strokes_per_ms);
             }
         }
 
@@ -9327,7 +9327,7 @@ namespace
         {
             if (job)
             {
-                job->adaptive_model_eta_ms = -1.0;
+                job->replication_pacing_model_eta_ms = -1.0;
             }
             return -1.0;
         }
@@ -9337,19 +9337,19 @@ namespace
             return raw_eta_ms;
         }
 
-        if (job->adaptive_model_eta_ms < 0.0 || !std::isfinite(job->adaptive_model_eta_ms))
+        if (job->replication_pacing_model_eta_ms < 0.0 || !std::isfinite(job->replication_pacing_model_eta_ms))
         {
-            job->adaptive_model_eta_ms = raw_eta_ms;
+            job->replication_pacing_model_eta_ms = raw_eta_ms;
         }
-        else if (raw_eta_ms > job->adaptive_model_eta_ms)
+        else if (raw_eta_ms > job->replication_pacing_model_eta_ms)
         {
-            job->adaptive_model_eta_ms = (job->adaptive_model_eta_ms * 0.70) + (raw_eta_ms * 0.30);
+            job->replication_pacing_model_eta_ms = (job->replication_pacing_model_eta_ms * 0.70) + (raw_eta_ms * 0.30);
         }
         else
         {
-            job->adaptive_model_eta_ms = (job->adaptive_model_eta_ms * 0.45) + (raw_eta_ms * 0.55);
+            job->replication_pacing_model_eta_ms = (job->replication_pacing_model_eta_ms * 0.45) + (raw_eta_ms * 0.55);
         }
-        return job->adaptive_model_eta_ms;
+        return job->replication_pacing_model_eta_ms;
     }
 
     auto mesh_first_progress_extra(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job,
@@ -9359,10 +9359,10 @@ namespace
                                    const std::string& extra = "") -> std::string
     {
         const int total_strokes = job ? static_cast<int>(job->strokes.size()) : 0;
-        const int server_batch_limit = std::max(1, job ? job->server_batch_limit : ServerPaintBatchStrokeLimit);
-        const int server_batch_delay_ms = std::max(0, job ? job->server_batch_delay_ms : ServerPaintBatchDelayMs);
-        const int local_batch_limit = std::max(1, job ? job->local_visual_sync_batch_limit : ServerPaintBatchStrokeLimit);
-        const int local_batch_delay_ms = std::max(0, job ? job->local_visual_sync_delay_ms : ServerPaintBatchDelayMs);
+        const int server_batch_limit = std::max(1, job ? job->server_batch_limit : PackedReplicationDefaultBatchLimit);
+        const int server_batch_delay_ms = std::max(0, job ? job->server_batch_delay_ms : PackedReplicationDefaultPacingMs);
+        const int local_batch_limit = std::max(1, job ? job->local_visual_sync_batch_limit : PackedReplicationDefaultBatchLimit);
+        const int local_batch_delay_ms = std::max(0, job ? job->local_visual_sync_delay_ms : PackedReplicationDefaultPacingMs);
         const int server_batches_total = mesh_first_div_ceil(total_strokes, server_batch_limit);
         const int local_batches_total = mesh_first_div_ceil(total_strokes, local_batch_limit);
         const int server_batches_done = job ? std::max(0, job->server_batch_success) : 0;
@@ -9441,7 +9441,7 @@ namespace
                                                   total_strokes,
                                                   remaining_server_batches,
                                                   server_batch_delay_ms);
-            if (job && job->adaptive_batch_enabled)
+            if (job && job->replication_pacing_enabled)
             {
                 server_eta_ms = mesh_first_server_model_eta_ms(job,
                                                                terminal,
@@ -9474,7 +9474,7 @@ namespace
                                                       total_strokes,
                                                       remaining_server_batches,
                                                       server_batch_delay_ms);
-                if (job && job->adaptive_batch_enabled && paint_strokes_done <= 0 && server_eta_ms < 0.0)
+                if (job && job->replication_pacing_enabled && paint_strokes_done <= 0 && server_eta_ms < 0.0)
                 {
                     paint_eta_ms = -1.0;
                 }
@@ -9486,7 +9486,7 @@ namespace
                         paint_eta_ms = std::max(paint_eta_ms, observed_paint_eta_ms);
                     }
                 }
-                paint_eta_source = job && job->adaptive_batch_enabled ? "queue_drain_model" : "observed_rate";
+                paint_eta_source = job && job->replication_pacing_enabled ? "queue_drain_model" : "observed_rate";
             }
             else
             {
@@ -9494,7 +9494,7 @@ namespace
                                    ? std::max(0, local_batches_total - 1) * static_cast<double>(local_batch_delay_ms)
                                    : 0.0;
                 paint_eta_ms = server_eta_ms + local_eta_ms;
-                paint_eta_source = job && job->adaptive_batch_enabled ? "queue_drain_model" : "observed_rate";
+                paint_eta_source = job && job->replication_pacing_enabled ? "queue_drain_model" : "observed_rate";
             }
         }
         else if (phase == MeshFirstBatchPhase::LocalSync)
@@ -9513,7 +9513,7 @@ namespace
             paint_eta_ms = 0.0;
             if (job)
             {
-                job->adaptive_model_eta_ms = 0.0;
+                job->replication_pacing_model_eta_ms = 0.0;
             }
         }
         std::string out = "\"progress_schema_version\":2";
@@ -9523,7 +9523,7 @@ namespace
         out += ",\"total_strokes\":" + std::to_string(total_strokes);
         out += ",\"server_batch_limit\":" + std::to_string(server_batch_limit);
         out += ",\"server_batch_delay_ms\":" + std::to_string(server_batch_delay_ms);
-        out += mesh_first_adaptive_metadata(job);
+        out += mesh_first_replication_pacing_metadata(job);
         out += ",\"server_batch_rpc\":\"" + json_escape(job ? job->server_batch_rpc : "ServerPackedPaintBatch") + "\"";
         out += ",\"server_packed_paint_batch_enabled\":" +
                std::string(json_bool(job && job->server_packed_paint_batch_enabled));
@@ -9620,8 +9620,8 @@ namespace
         const bool preview_only = json_bool_field(request, "preview_only", false);
         const bool unpreview_only = json_bool_field(request, "unpreview_only", false);
         const bool normal_paint_requires_packed = !preview_only && !unpreview_only;
-        const int packed_server_batch_limit = MeshFirstAdaptiveFallbackMaxOutgoingStrokesPerBatch;
-        const int packed_server_batch_seed_delay_ms = MeshFirstServerBatchMinDelayMs;
+        const int packed_server_batch_limit = PackedReplicationBatchSize;
+        const int packed_server_batch_seed_delay_ms = PackedReplicationMinPacingMs;
         const bool research_artifacts = json_bool_field(request, "research_artifacts", false);
         const double tuning_stroke_size_texels = clamp_range(json_number_field(request, "stroke_size_texels", 9.0), 1.0, 12.0);
         const double tuning_coverage_step_texels = clamp_range(json_number_field(request, "coverage_step_texels", 9.0), 1.0, 12.0);
@@ -9635,9 +9635,10 @@ namespace
         const double fill_color_b = clamp_range(json_number_field(request, "fill_color_b", 1.0), 0.0, 1.0);
         const double fill_metallic = clamp_range(json_number_field(request, "fill_metallic", 1.0), 0.0, 1.0);
         const double fill_roughness = clamp_range(json_number_field(request, "fill_roughness", 0.0), 0.0, 1.0);
-        const bool tuning_adaptive_batch_enabled = json_bool_field(request, "adaptive_batch_enabled", true);
-        const int tuning_server_batch_limit = json_int_field(request, "server_batch_limit", ServerPaintBatchStrokeLimit, 1, ServerPaintBatchStrokeLimitMax);
-        const int tuning_server_batch_delay_ms = json_int_field(request, "server_batch_delay_ms", ServerPaintBatchDelayMs, 150, 500);
+        const bool tuning_replication_pacing_enabled =
+            json_bool_field(request, "replication_pacing_enabled", json_bool_field(request, "adaptive_batch_enabled", true));
+        const int tuning_server_batch_limit = json_int_field(request, "server_batch_limit", PackedReplicationDefaultBatchLimit, 1, PackedReplicationMaxBatchLimit);
+        const int tuning_server_batch_delay_ms = json_int_field(request, "server_batch_delay_ms", PackedReplicationDefaultPacingMs, 150, 500);
         const std::string requested_server_batch_rpc = json_string_field(request, "server_batch_rpc", "");
         const std::string requested_server_batch_rpc_normalized = lower_copy(requested_server_batch_rpc);
         const std::string requested_packed_route = lower_copy(json_string_field(request, "packed_route", "component"));
@@ -9697,8 +9698,8 @@ namespace
         metadata += ",\"fill_color_b\":" + std::to_string(fill_color_b);
         metadata += ",\"fill_metallic\":" + std::to_string(fill_metallic);
         metadata += ",\"fill_roughness\":" + std::to_string(fill_roughness);
-        metadata += ",\"adaptive_batch_requested_enabled\":" + std::string(json_bool(tuning_adaptive_batch_enabled));
-        metadata += ",\"adaptive_batch_enabled\":" + std::string(json_bool(normal_paint_requires_packed));
+        metadata += ",\"replication_pacing_requested_enabled\":" + std::string(json_bool(tuning_replication_pacing_enabled));
+        metadata += ",\"replication_pacing_enabled\":" + std::string(json_bool(normal_paint_requires_packed));
         metadata += ",\"server_batch_limit\":" +
                     std::to_string(normal_paint_requires_packed ? packed_server_batch_limit : tuning_server_batch_limit);
         metadata += ",\"server_batch_delay_ms\":" +
@@ -10698,7 +10699,7 @@ namespace
             normal_paint_requires_packed ? packed_server_batch_limit : tuning_server_batch_limit;
         const int effective_server_batch_delay_ms =
             normal_paint_requires_packed ? packed_server_batch_seed_delay_ms
-                                         : std::max(MeshFirstServerBatchMinDelayMs, tuning_server_batch_delay_ms);
+                                         : std::max(PackedReplicationMinPacingMs, tuning_server_batch_delay_ms);
         const int estimated_batches = (static_cast<int>(strokes.size()) + std::max(1, effective_replay_server_batch_limit) - 1) /
                                       std::max(1, effective_replay_server_batch_limit);
         const int estimated_replay_ms = std::max(0, estimated_batches - 1) * effective_server_batch_delay_ms;
@@ -10767,7 +10768,7 @@ namespace
         metadata += ",\"server_packed_source_id_offset\":\"" + hex_address(RuntimePaintableComponentPackedSourceIdOffset) + "\"";
         metadata += ",\"server_packed_source_id_available\":" + std::string(json_bool(packed_source_id_available));
         metadata += ",\"server_packed_source_id_failure\":\"" + json_escape(packed_source_id_failure) + "\"";
-        metadata += ",\"server_packed_batch_limit_cap\":" + std::to_string(MeshFirstAdaptiveFallbackMaxOutgoingStrokesPerBatch);
+        metadata += ",\"server_packed_batch_limit_cap\":" + std::to_string(PackedReplicationBatchSize);
         metadata += ",\"server_batch_limit_requested\":" + std::to_string(tuning_server_batch_limit);
         metadata += ",\"server_batch_limit_ignored_for_packed\":" + std::string(json_bool(normal_paint_requires_packed));
         metadata += ",\"server_batch_limit_effective\":" + std::to_string(effective_replay_server_batch_limit);
@@ -11101,25 +11102,25 @@ namespace
                 replication_before.manager_max_outgoing_network_batches_per_second;
             async_job->replication_manager_coalesce_outgoing_strokes =
                 replication_before.manager_coalesce_outgoing_strokes;
-            async_job->adaptive_batch_enabled = normal_paint_requires_packed;
-            async_job->adaptive_requested_batch_limit = effective_replay_server_batch_limit;
-            async_job->adaptive_requested_delay_ms = effective_server_batch_delay_ms;
-            mesh_first_update_adaptive_model(async_job, replication_before);
-            if (async_job->adaptive_batch_enabled)
+            async_job->replication_pacing_enabled = normal_paint_requires_packed;
+            async_job->replication_pacing_requested_batch_limit = effective_replay_server_batch_limit;
+            async_job->replication_pacing_requested_delay_ms = effective_server_batch_delay_ms;
+            mesh_first_update_replication_pacing_model(async_job, replication_before);
+            if (async_job->replication_pacing_enabled)
             {
-                mesh_first_update_adaptive_resolved_batch(async_job, replication_before);
-                mesh_first_set_adaptive_effective(async_job,
-                                                  mesh_first_adaptive_resolved_batch(async_job),
+                mesh_first_update_replication_pacing_resolved_batch(async_job, replication_before);
+                mesh_first_set_replication_pacing_effective(async_job,
+                                                  mesh_first_replication_pacing_resolved_batch(async_job),
                                                   effective_server_batch_delay_ms);
                 const auto initial_level =
-                    mesh_first_adaptive_queue_gate_pressure_level(async_job, replication_before);
-                async_job->adaptive_pressure_level = mesh_first_adaptive_pressure_level_name(initial_level);
+                    mesh_first_replication_pacing_queue_gate_pressure_level(async_job, replication_before);
+                async_job->replication_pacing_pressure_level = mesh_first_replication_pacing_pressure_level_name(initial_level);
             }
             else
             {
-                async_job->adaptive_resolved_batch_limit = effective_replay_server_batch_limit;
-                mesh_first_set_adaptive_effective(async_job, effective_replay_server_batch_limit, effective_server_batch_delay_ms);
-                async_job->adaptive_pressure_level = "disabled";
+                async_job->replication_pacing_resolved_batch_limit = effective_replay_server_batch_limit;
+                mesh_first_set_replication_pacing_effective(async_job, effective_replay_server_batch_limit, effective_server_batch_delay_ms);
+                async_job->replication_pacing_pressure_level = "disabled";
             }
             async_job->server_texture_sync_poll_ms = MeshFirstServerTextureSyncPollMs;
             async_job->server_texture_sync_max_polls = MeshFirstServerTextureSyncMaxPolls;
@@ -11234,7 +11235,7 @@ namespace
                                  ",\"local_strokes_total\":" + std::to_string(local_total) +
                                  ",\"local_elapsed_ms\":" + std::to_string(local_elapsed_ms) +
                                  ",\"local_eta_ms\":0" +
-                                 mesh_first_adaptive_metadata(job) +
+                                 mesh_first_replication_pacing_metadata(job) +
                                  ",\"paint_elapsed_ms\":" + std::to_string(job ? mesh_first_elapsed_ms(job) : -1.0) +
                                  ",\"paint_eta_ms\":0" +
                                  ",\"remaining_strokes\":" + std::to_string(remaining_strokes));
@@ -11443,7 +11444,7 @@ namespace
             metadata += ",\"server_batch_elapsed_ms\":" + std::to_string(job->server_batch_elapsed_ms);
             metadata += ",\"server_elapsed_ms\":" + std::to_string(job->server_batch_elapsed_ms);
             metadata += ",\"server_eta_ms\":0";
-            metadata += mesh_first_adaptive_metadata(job);
+            metadata += mesh_first_replication_pacing_metadata(job);
             metadata += ",\"local_batch_limit\":" + std::to_string(job->local_visual_sync_batch_limit);
             metadata += ",\"local_batch_delay_ms\":" + std::to_string(job->local_visual_sync_delay_ms);
             metadata += ",\"local_batch_calls\":" + std::to_string(job->local_batch_calls);
@@ -11527,7 +11528,7 @@ namespace
             metadata += ",\"server_batch_elapsed_ms\":" + std::to_string(job->server_batch_elapsed_ms);
             metadata += ",\"server_elapsed_ms\":" + std::to_string(job->server_batch_elapsed_ms);
             metadata += ",\"server_eta_ms\":0";
-            metadata += mesh_first_adaptive_metadata(job);
+            metadata += mesh_first_replication_pacing_metadata(job);
             metadata += ",\"local_batch_limit\":" + std::to_string(job->local_visual_sync_batch_limit);
             metadata += ",\"local_batch_delay_ms\":" + std::to_string(job->local_visual_sync_delay_ms);
             metadata += ",\"local_batch_calls\":" + std::to_string(job->local_batch_calls);
@@ -11969,28 +11970,28 @@ namespace
 
         if (job->next_dispatch_time.time_since_epoch().count() != 0)
         {
-            job->adaptive_last_timer_drift_ms =
+            job->replication_pacing_last_timer_drift_ms =
                 std::max(0.0, std::chrono::duration<double, std::milli>(now - job->next_dispatch_time).count());
         }
 
-        auto capture_adaptive_pressure = [&]() -> MeshFirstReplicationSnapshot {
+        auto capture_replication_pacing_pressure = [&]() -> MeshFirstReplicationSnapshot {
             return mesh_first_capture_cached_replication_snapshot(job);
         };
 
-        job->adaptive_pre_pressure = capture_adaptive_pressure();
-        mesh_first_update_adaptive_model(job, job->adaptive_pre_pressure);
+        job->replication_pacing_pre_pressure = capture_replication_pacing_pressure();
+        mesh_first_update_replication_pacing_model(job, job->replication_pacing_pre_pressure);
 
-        if (job->adaptive_batch_enabled)
+        if (job->replication_pacing_enabled)
         {
-            mesh_first_update_adaptive_resolved_batch(job, job->adaptive_pre_pressure);
-            mesh_first_set_adaptive_effective(job,
-                                              mesh_first_adaptive_resolved_batch(job),
-                                              mesh_first_adaptive_requested_delay(job));
-            auto pre_level = mesh_first_adaptive_queue_gate_pressure_level(job, job->adaptive_pre_pressure);
-            job->adaptive_pressure_level = mesh_first_adaptive_pressure_level_name(pre_level);
-            if (!mesh_first_adaptive_queue_gate_open(job, job->adaptive_pre_pressure))
+            mesh_first_update_replication_pacing_resolved_batch(job, job->replication_pacing_pre_pressure);
+            mesh_first_set_replication_pacing_effective(job,
+                                              mesh_first_replication_pacing_resolved_batch(job),
+                                              mesh_first_replication_pacing_requested_delay(job));
+            auto pre_level = mesh_first_replication_pacing_queue_gate_pressure_level(job, job->replication_pacing_pre_pressure);
+            job->replication_pacing_pressure_level = mesh_first_replication_pacing_pressure_level_name(pre_level);
+            if (!mesh_first_replication_pacing_queue_gate_open(job, job->replication_pacing_pre_pressure))
             {
-                ++job->adaptive_backoff_count;
+                ++job->replication_pacing_backoff_count;
                 write_mesh_progress("mesh_server_batch_throttle",
                                     "Waiting for paint replication queue to drain",
                                     job->server_strokes_sent,
@@ -12027,7 +12028,7 @@ namespace
                                                                        job->server_packed_paint_source_id,
                                                                        job->texture_size,
                                                                        batch_failure);
-        job->adaptive_last_rpc_ms =
+        job->replication_pacing_last_rpc_ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - rpc_started).count();
         if (!batch_ok)
         {
@@ -12045,17 +12046,17 @@ namespace
         job->offset += count;
         job->server_batch_elapsed_ms = elapsed_ms();
 
-        job->adaptive_post_pressure = capture_adaptive_pressure();
-        mesh_first_update_adaptive_model(job, job->adaptive_post_pressure);
+        job->replication_pacing_post_pressure = capture_replication_pacing_pressure();
+        mesh_first_update_replication_pacing_model(job, job->replication_pacing_post_pressure);
 
-        if (job->adaptive_batch_enabled)
+        if (job->replication_pacing_enabled)
         {
-            mesh_first_update_adaptive_resolved_batch(job, job->adaptive_post_pressure);
-            mesh_first_set_adaptive_effective(job,
-                                              mesh_first_adaptive_resolved_batch(job),
-                                              mesh_first_adaptive_requested_delay(job));
-            job->adaptive_pressure_level =
-                mesh_first_adaptive_pressure_level_name(mesh_first_adaptive_queue_gate_pressure_level(job, job->adaptive_post_pressure));
+            mesh_first_update_replication_pacing_resolved_batch(job, job->replication_pacing_post_pressure);
+            mesh_first_set_replication_pacing_effective(job,
+                                              mesh_first_replication_pacing_resolved_batch(job),
+                                              mesh_first_replication_pacing_requested_delay(job));
+            job->replication_pacing_pressure_level =
+                mesh_first_replication_pacing_pressure_level_name(mesh_first_replication_pacing_queue_gate_pressure_level(job, job->replication_pacing_post_pressure));
         }
 
         if (job->local_visual_sync_enabled)
