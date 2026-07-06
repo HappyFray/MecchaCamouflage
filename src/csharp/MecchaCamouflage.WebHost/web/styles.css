@@ -1,3 +1,27 @@
+@font-face {
+  font-family: "D-DIN";
+  src: url("./fonts/d-din/D-DIN.otf") format("opentype");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 400;
+}
+
+@font-face {
+  font-family: "D-DIN";
+  src: url("./fonts/d-din/D-DIN-Bold.otf") format("opentype");
+  font-display: swap;
+  font-style: normal;
+  font-weight: 700;
+}
+
+@font-face {
+  font-family: "D-DIN";
+  src: url("./fonts/d-din/D-DIN-Italic.otf") format("opentype");
+  font-display: swap;
+  font-style: italic;
+  font-weight: 400;
+}
+
 :root {
   color-scheme: dark;
   --primary: #ffffff;
@@ -14,8 +38,9 @@
   --error: #e52020;
   --status-ok: #4fd16a;
   --status-warn: #f1c40f;
-  --font-ui: "Segoe UI", system-ui, sans-serif;
-  --font-mono: "Cascadia Mono", "Consolas", monospace;
+  --font-stack: "D-DIN", Arial, Verdana, sans-serif;
+  --font-ui: var(--font-stack);
+  --font-mono: var(--font-stack);
 }
 
 * {
