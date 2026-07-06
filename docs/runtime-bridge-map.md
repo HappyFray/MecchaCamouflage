@@ -1,6 +1,6 @@
 # Runtime Bridge Responsibility Map
 
-This document is the cleanup map for `runtime/src/bridge.cpp`. Its purpose is
+This document is the cleanup map for `src/native/bridge/bridge.cpp`. Its purpose is
 to make dead-code review safer before any deletion or file split.
 
 Current policy: do not delete or split bridge code before the code path is
@@ -91,6 +91,14 @@ diagnostics, or tightly scoped bug fixes with live verification.
 - Packed paint serialization and `ServerPackedPaintBatch` RPC dispatch.
 - Async paint job lifecycle, progress sidecar writing, cancellation, and guards.
 - Research/probe commands and bridge IPC dispatch.
+
+Low-risk helpers are mechanically split into `.inc` files while preserving a
+single native translation unit:
+
+- `src/native/bridge/bridge_json.inc`: JSON field parsing, JSON escaping,
+  metadata compaction, and response JSON formatting.
+- `src/native/bridge/bridge_sidecar.inc`: bridge sidecar paths, progress
+  snapshot writing, listener status writing, and bridge port sidecar reading.
 
 Replication-specific research notes live in
 `docs/runtime-paint-replication-research.md`.

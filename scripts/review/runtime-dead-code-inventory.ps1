@@ -165,7 +165,7 @@ Push-Location $RepoRoot
 try {
     Write-Utf8Lines -Path (Join-Path $OutDir "commit.txt") -Lines @((& git rev-parse HEAD 2>&1) | ForEach-Object { $_.ToString() })
     Write-Utf8Lines -Path (Join-Path $OutDir "status.txt") -Lines @((& git status --short 2>&1) | ForEach-Object { $_.ToString() })
-    Write-Utf8Lines -Path (Join-Path $OutDir "runtime-files.txt") -Lines @((& git ls-files runtime assets scripts docs Makefile 2>&1) | ForEach-Object { $_.ToString() })
+    Write-Utf8Lines -Path (Join-Path $OutDir "source-files.txt") -Lines @((& git ls-files src resources scripts docs Makefile 2>&1) | ForEach-Object { $_.ToString() })
 }
 finally {
     Pop-Location
@@ -186,7 +186,7 @@ $availability = foreach ($tool in $tools) {
 }
 Write-Utf8Lines -Path (Join-Path $OutDir "tool-availability.txt") -Lines $availability
 
-$reviewPaths = @("runtime/src", "runtime/include", "runtime/csharp", "scripts", "docs") |
+$reviewPaths = @("src/native", "src/csharp", "resources", "scripts", "docs") |
     Where-Object { Test-Path (Join-Path $RepoRoot $_) }
 
 Invoke-RgReport -OutputFile "native-hotspots.txt" -Paths $reviewPaths -Pattern "ServerPackedPaintBatch|ServerRelayPackedStrokeBatch|ServerCompactPaintBatch|SendCustomStrokeBatchToServer|ProcessEvent|paint_component|RuntimePaintable|mesh_first|runtime_triangle|preview_only|unpreview_only|PackedPaint|FCompactPaintStroke"
@@ -199,7 +199,7 @@ Invoke-RgReport -OutputFile "legacy-fallbacks.txt" -Paths $reviewPaths -Pattern 
 
 Invoke-RgReport -OutputFile "ui-native-command-surface.txt" -Paths $reviewPaths -Pattern 'chrome\.webview|WebMessageReceived|PostWebMessageAsJson|Invoke|command|type"\s*:\s*"|paint_full_route|cancel_paint|preview|unpreview|capabilities|diagnostic|ServerPackedPaintBatch|replication_pacing|adaptive|serverBatch'
 
-$csprojRoot = Join-Path $RepoRoot "runtime/csharp"
+$csprojRoot = Join-Path $RepoRoot "src/csharp"
 if (Test-Path $csprojRoot) {
     $projects = Get-ChildItem -LiteralPath $csprojRoot -Recurse -Filter "*.csproj" |
         Sort-Object FullName |
@@ -209,13 +209,13 @@ if (Test-Path $csprojRoot) {
 
 if (Has-Tool "cppcheck") {
     Invoke-OptionalReport -Name "cppcheck" -OutputFile "cppcheck.txt" -Command {
-        cppcheck --enable=warning,style,performance,portability,information,unusedFunction --inline-suppr --suppress=missingIncludeSystem runtime/src runtime/include
+        cppcheck --enable=warning,style,performance,portability,information,unusedFunction --inline-suppr --suppress=missingIncludeSystem src/native
     }
 }
 
 if ((Has-Tool "clang-tidy") -and (Test-Path (Join-Path $RepoRoot "compile_commands.json"))) {
     Invoke-OptionalReport -Name "clang-tidy" -OutputFile "clang-tidy.txt" -Command {
-        clang-tidy -p . runtime/src/bridge.cpp runtime/src/injector.cpp
+        clang-tidy -p . src/native/bridge/bridge.cpp src/native/injector/injector.cpp
     }
 }
 elseif (Has-Tool "clang-tidy") {
@@ -224,7 +224,7 @@ elseif (Has-Tool "clang-tidy") {
 
 if (Has-Tool "dotnet") {
     Invoke-OptionalReport -Name "dotnet format verify" -OutputFile "dotnet-format.txt" -Command {
-        $projects = Get-ChildItem -LiteralPath "runtime/csharp" -Recurse -Filter "*.csproj" | Sort-Object FullName
+        $projects = Get-ChildItem -LiteralPath "src/csharp" -Recurse -Filter "*.csproj" | Sort-Object FullName
         foreach ($project in $projects) {
             Write-Output "## $((Resolve-Path -LiteralPath $project.FullName).Path)"
             dotnet format $project.FullName --verify-no-changes --severity warn

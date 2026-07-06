@@ -5,7 +5,7 @@ This project pins OSS game-research tools as git submodules under
 or SDK investigation.
 
 The normal runtime build requires the WebView2 controller host, the native bridge and
-injector, and the reviewed mesh profile artifacts under `assets/mesh-profiles/`.
+injector, and the reviewed mesh profile artifacts under `resources/mesh-profiles/`.
 The tools below are for update recovery and profile regeneration, not normal
 app builds.
 
@@ -15,7 +15,7 @@ investigation scripts under `scripts/research/`; keep generated output under
 `artifacts/research/` or a local temp directory.
 
 v1.5.0 uses the mesh-first paint route. The required game-derived mesh profiles
-are tracked under `assets/mesh-profiles/`; `make build` copies the required
+are tracked under `resources/mesh-profiles/`; `make build` copies the required
 profile assets into the local build output for package/debug runs. After game
 updates, initialize the research-tool
 submodules and run `make mesh MAPPINGS=<path-to-usmap>` to regenerate the
@@ -73,7 +73,7 @@ make mesh \
   GAME_VERSION=GAME_UE5_6
 ```
 
-The command writes `assets/mesh-profiles/paintman.mesh-profile-v2.json` after
+The command writes `resources/mesh-profiles/paintman.mesh-profile-v2.json` after
 validating the expected Paintman LOD0 shape. It fails closed if CUE4Parse,
 game archives, mappings, or the expected mesh shape are unavailable.
 
@@ -88,14 +88,14 @@ When a game update breaks painting, use this order:
    trustworthy layout or the engine-side mapping changed.
 4. Generate a current `.usmap` locally if the previous mapping no longer works.
 5. Run `make mesh MAPPINGS=<path-to-current.usmap>` to regenerate the profile.
-6. Review and commit regenerated shipping profiles in `assets/mesh-profiles/`.
+6. Review and commit regenerated shipping profiles in `resources/mesh-profiles/`.
    `scripts/build.ps1` copies profiles into `.build/bin/mesh-profiles/` for
    package/debug runs.
 
 Commit only reviewed project artifacts:
 
-- source changes under `runtime/`, `scripts/`, or docs
-- small regenerated profile JSON files under `assets/mesh-profiles/` that are
+- source changes under `src/`, `scripts/`, or docs
+- small regenerated profile JSON files under `resources/mesh-profiles/` that are
   intended to ship
 - submodule pointer updates when a pinned research tool version changes
 - pinned patch files or instructions if a research tool needs local changes

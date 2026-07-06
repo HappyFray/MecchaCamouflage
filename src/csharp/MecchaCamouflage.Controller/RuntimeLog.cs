@@ -39,7 +39,25 @@ public sealed class RuntimeLog
             while (lines.Count > 400)
                 lines.RemoveAt(0);
         }
-        File.AppendAllText(path, line + Environment.NewLine);
+        TryAppendLine(path, line);
         Changed?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void TryAppendLine(string path, string line)
+    {
+        try
+        {
+            lock (gate)
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+                using var stream = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
+                using var writer = new StreamWriter(stream);
+                writer.WriteLine(line);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Runtime logging is best-effort. The in-memory log remains the UI source.
+        }
     }
 }

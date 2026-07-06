@@ -17,6 +17,7 @@ public sealed record DiagnosticsSnapshot(
 public static class DiagnosticsState
 {
     private static readonly object Gate = new();
+    private static readonly object FileGate = new();
     private static AppPaths? paths;
     private static string startupPhase = "starting";
     private static string assetValidation = "not checked";
@@ -143,7 +144,7 @@ public static class DiagnosticsState
                 ? Path.Combine(paths.DiagnosticsDirectory, $"startup-{DateTime.Now:yyyyMMdd-HHmmss}-{Environment.ProcessId}.log")
                 : startupLogPath;
         }
-        File.AppendAllText(path, $"{DateTimeOffset.Now:O} [{category}] {message}{Environment.NewLine}");
+        TryAppendLine(path, $"{DateTimeOffset.Now:O} [{category}] {message}");
     }
 
     private static void Set(ref string field, string category, string value)
@@ -179,7 +180,7 @@ public static class DiagnosticsState
         if (currentPaths is null)
             return;
         Directory.CreateDirectory(currentPaths.DiagnosticsDirectory);
-        var path = Path.Combine(currentPaths.DiagnosticsDirectory, $"crash-{DateTime.Now:yyyyMMdd-HHmmss}-{Environment.ProcessId}.json");
+        var path = Path.Combine(currentPaths.DiagnosticsDirectory, $"crash-{DateTime.Now:yyyyMMdd-HHmmss-fff}-{Environment.ProcessId}-{Guid.NewGuid():N}.json");
         var payload = new
         {
             phase,
@@ -189,6 +190,33 @@ public static class DiagnosticsState
             fileName = exception is FileNotFoundException fileNotFound ? fileNotFound.FileName : "",
             text = exception.ToString()
         };
-        File.WriteAllText(path, JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true }));
+        try
+        {
+            File.WriteAllText(path, JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true }));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Diagnostics must never replace the original startup failure.
+        }
+    }
+
+    private static void TryAppendLine(string path, string line)
+    {
+        try
+        {
+            lock (FileGate)
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+                using var stream = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
+                using var writer = new StreamWriter(stream);
+                writer.WriteLine(line);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // A diagnostic log can be temporarily locked by another thread,
+            // another app instance, an editor, or security software. Keep the
+            // controller alive and preserve the original error path.
+        }
     }
 }

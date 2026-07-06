@@ -1,9 +1,9 @@
 <p align="center">
-  <img src="assets/meccha-camouflage-readme-banner-v151-1600w.jpg" alt="Meccha Camouflage demo" width="900" />
+  <img src="docs/assets/meccha-camouflage-readme-banner-v151-1600w.jpg" alt="Meccha Camouflage demo" width="900" />
 </p>
 
 <h1>
-  <img src="assets/icon.png" alt="Meccha Camouflage icon" width="36" />
+  <img src="resources/app-icons/icon.png" alt="Meccha Camouflage icon" width="36" />
   Meccha Camouflage
 </h1>
 
@@ -38,6 +38,8 @@ make run
 
 Game update work, mesh profile regeneration, and research-tool setup are
 documented in [docs/research-tools.md](docs/research-tools.md).
+Repository layout and generated-output policy are documented in
+[docs/repository-layout.md](docs/repository-layout.md).
 
 ## License
 

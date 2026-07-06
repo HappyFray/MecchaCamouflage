@@ -8,7 +8,7 @@
     <Nullable>enable</Nullable>
     <AssemblyName>meccha-camouflage</AssemblyName>
     <RootNamespace>MecchaCamouflage.WebHost</RootNamespace>
-    <ApplicationIcon>..\..\..\assets\icon.ico</ApplicationIcon>
+    <ApplicationIcon>..\..\..\resources\app-icons\icon.ico</ApplicationIcon>
     <MecchaAppVersion Condition="'$(MecchaAppVersion)' == ''">dev</MecchaAppVersion>
     <MecchaWebView2Version Condition="'$(MecchaWebView2Version)' == ''">unknown</MecchaWebView2Version>
   </PropertyGroup>
@@ -34,7 +34,7 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>Never</CopyToPublishDirectory>
     </Content>
-    <Content Include="..\..\..\assets\icon.ico" Link="web\icon.ico">
+    <Content Include="..\..\..\resources\app-icons\icon.ico" Link="web\icon.ico">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>Never</CopyToPublishDirectory>
     </Content>
@@ -44,7 +44,7 @@
     <EmbeddedResource Include="web\**\*">
       <LogicalName>packaged/web/%(RecursiveDir)%(Filename)%(Extension)</LogicalName>
     </EmbeddedResource>
-    <EmbeddedResource Include="..\..\..\assets\icon.ico">
+    <EmbeddedResource Include="..\..\..\resources\app-icons\icon.ico">
       <LogicalName>packaged/web/icon.ico</LogicalName>
     </EmbeddedResource>
     <EmbeddedResource Include="$(MecchaNativeRuntimeDir)\runtime-bridge.dll" Condition="'$(MecchaNativeRuntimeDir)' != ''">

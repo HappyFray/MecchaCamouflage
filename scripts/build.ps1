@@ -187,11 +187,11 @@ $WebView2FixedVersion = "150.0.4078.48"
 $WebView2FixedRuntimeUrl = "https://msedge.sf.dl.delivery.mp.microsoft.com/filestreamingservice/files/60926d99-f201-46bb-91a0-d868dc06b275/Microsoft.WebView2.FixedVersionRuntime.150.0.4078.48.x64.cab"
 $WebView2CacheRoot = Join-Path $RuntimeRoot ".build\cache\webview2\$WebView2FixedVersion\win-x64"
 
-$BridgeSource = Join-Path $RuntimeRoot "runtime\src\bridge.cpp"
-$InjectorSource = Join-Path $RuntimeRoot "runtime\src\injector.cpp"
-$WebHostProject = Join-Path $RuntimeRoot "runtime\csharp\MecchaCamouflage.WebHost\MecchaCamouflage.WebHost.csproj"
-$TestsProject = Join-Path $RuntimeRoot "runtime\csharp\MecchaCamouflage.Tests\MecchaCamouflage.Tests.csproj"
-$MeshProfilesSourceDir = Join-Path $RuntimeRoot "assets\mesh-profiles"
+$BridgeSource = Join-Path $RuntimeRoot "src\native\bridge\bridge.cpp"
+$InjectorSource = Join-Path $RuntimeRoot "src\native\injector\injector.cpp"
+$WebHostProject = Join-Path $RuntimeRoot "src\csharp\MecchaCamouflage.WebHost\MecchaCamouflage.WebHost.csproj"
+$TestsProject = Join-Path $RuntimeRoot "src\csharp\MecchaCamouflage.Tests\MecchaCamouflage.Tests.csproj"
+$MeshProfilesSourceDir = Join-Path $RuntimeRoot "resources\mesh-profiles"
 
 foreach ($path in @($BridgeSource, $InjectorSource, $WebHostProject, $TestsProject)) {
     if (-not (Test-Path $path -PathType Leaf)) {

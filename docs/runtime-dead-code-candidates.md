@@ -76,11 +76,11 @@ Classification: removed.
 Evidence:
 
 - canonical `scripts/build.ps1` publishes
-  `runtime/csharp/MecchaCamouflage.WebHost/MecchaCamouflage.WebHost.csproj`
-- build script does not publish or test
-  `runtime/csharp/MecchaCamouflage.Wpf/MecchaCamouflage.Wpf.csproj`
-- WPF still contains old delay/batch-related UI, while the supported WebHost UI
-  hides legacy batch tuning
+  `src/csharp/MecchaCamouflage.WebHost/MecchaCamouflage.WebHost.csproj`
+- legacy WPF and WinUI controller projects were not published or tested by the
+  canonical build
+- WPF still contained old delay/batch-related UI, while the supported WebHost
+  UI hides legacy batch tuning
 
 Risk:
 
@@ -89,7 +89,8 @@ Risk:
 
 Result:
 
-- deleted `runtime/csharp/MecchaCamouflage.Wpf/`
+- deleted legacy WPF controller project
+- deleted legacy WinUI controller project
 - canonical build still publishes WebHost only
 
 ## Removed: Batch/Adaptive Localization Keys

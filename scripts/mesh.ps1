@@ -61,7 +61,7 @@ if ([string]::IsNullOrWhiteSpace($Cue4ParsePath)) {
 
 if ([string]::IsNullOrWhiteSpace($OutputPath)) {
     $SafeExportName = if ([string]::IsNullOrWhiteSpace($ExportName)) { "mesh" } else { $ExportName -replace '[^A-Za-z0-9_.-]', '_' }
-    $OutputPath = Join-Path $RepoRoot "assets\mesh-profiles\$SafeExportName.mesh-profile-v2.json"
+    $OutputPath = Join-Path $RepoRoot "resources\mesh-profiles\$SafeExportName.mesh-profile-v2.json"
 }
 
 $PaksPath = Require-Path $PaksPath "MECCHA CHAMELEON Paks directory"
@@ -74,7 +74,7 @@ $Cue4ParseProject = Require-Path $Cue4ParseProject "CUE4Parse project"
 $Cue4ParseConversionProject = Require-Path $Cue4ParseConversionProject "CUE4Parse conversion project"
 
 $Dotnet = Get-Command dotnet -ErrorAction Stop
-$ToolDir = Join-Path $RepoRoot ".build\mesh-profile-tool"
+$ToolDir = Join-Path $RepoRoot ".build\tools\mesh-profile-tool"
 New-Item -ItemType Directory -Force -Path $ToolDir | Out-Null
 if ([string]::IsNullOrWhiteSpace($OodlePath)) {
     $OodlePath = Join-Path $ToolDir ($(if ($IsLinux) { "liboodle-data-shared.so" } else { "oodle-data-shared.dll" }))

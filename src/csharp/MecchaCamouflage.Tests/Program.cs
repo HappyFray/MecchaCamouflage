@@ -13,6 +13,8 @@ var tests = new List<(string Name, Action Run)>
     ("asset validation rejects stale ready cache", AssetValidationRejectsStaleReadyCache),
     ("copy if invalid repairs corrupt target", CopyIfInvalidRepairsCorruptTarget),
     ("diagnostic summary includes file not found details", DiagnosticSummaryIncludesFileNotFoundDetails),
+    ("diagnostics log write is best effort when file is locked", DiagnosticsLogWriteIsBestEffortWhenFileLocked),
+    ("runtime log write is best effort when file is locked", RuntimeLogWriteIsBestEffortWhenFileLocked),
     ("auto material defaults off", AutoMaterialDefaultsOff),
     ("front region defaults to fill", FrontRegionDefaultsToFill),
     ("bridge messages are user friendly", BridgeMessagesAreUserFriendly),
@@ -226,6 +228,44 @@ static void DiagnosticSummaryIncludesFileNotFoundDetails()
 
     Assert(summary.Contains("last_exception_hresult: 0x80070002", StringComparison.OrdinalIgnoreCase), "summary should include HResult");
     Assert(summary.Contains("last_exception_file: missing-runtime.dll", StringComparison.OrdinalIgnoreCase), "summary should include missing file name");
+}
+
+static void DiagnosticsLogWriteIsBestEffortWhenFileLocked()
+{
+    using var temp = new TempHome();
+    var paths = new AppPaths("diagnostics-lock-test");
+    DiagnosticsState.Initialize(paths, "diagnostics-lock-test");
+    var startupLogPath = StartupLogPath(DiagnosticsState.Summary(paths));
+
+    using var locked = new FileStream(startupLogPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+
+    DiagnosticsState.WriteLine("unit-test", "this write should be skipped instead of crashing");
+    DiagnosticsState.RecordException("locked-log-test", new InvalidOperationException("expected test exception"));
+}
+
+static void RuntimeLogWriteIsBestEffortWhenFileLocked()
+{
+    using var temp = new TempHome();
+    var paths = new AppPaths("runtime-log-lock-test");
+    var log = new RuntimeLog(paths);
+    var path = Path.Combine(paths.LogDirectory, $"runtime-{DateTime.Now:yyyy-MM-dd}.log");
+
+    Directory.CreateDirectory(paths.LogDirectory);
+    using var locked = new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+
+    log.Info("Runtime log should keep updating the in-memory UI state.");
+
+    Assert(log.Text.Contains("Runtime log should keep updating", StringComparison.Ordinal), "in-memory log should still update");
+}
+
+static string StartupLogPath(string summary)
+{
+    var line = summary
+        .Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries)
+        .FirstOrDefault(value => value.StartsWith("startup_log: ", StringComparison.OrdinalIgnoreCase));
+    if (string.IsNullOrWhiteSpace(line))
+        throw new InvalidOperationException("summary should include startup log path");
+    return line["startup_log: ".Length..].Trim();
 }
 
 static void AutoMaterialDefaultsOff()
