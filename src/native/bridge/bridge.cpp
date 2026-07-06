@@ -43,7 +43,7 @@ namespace
     // Win32 hooks, progress sidecars, and C# host diagnostics.
     // =============================================================================
 
-    constexpr int DefaultBridgePort = 47654;
+    constexpr int DefaultBridgePort = 47800;
     constexpr std::size_t MaxRequestBytes = 8 * 1024 * 1024;
     constexpr int ProcessEventVtableIndex = 0x4C;
     constexpr int AutoEventWatchSampleBytes = 8192;

@@ -1,5 +1,5 @@
 param(
-    [int[]]$Ports = @(50262, 50263, 50264, 50265),
+    [int[]]$Ports = @(47800, 47801, 47802, 47803),
     [int]$Samples = 60,
     [int]$IntervalMs = 250,
     [string]$HostName = "127.0.0.1"

@@ -2,7 +2,7 @@ param(
     [ValidateSet("ping", "capabilities", "paint_replication_probe", "paint_replication_pressure_probe", "paint_packed_replay_probe")]
     [string]$Type = "paint_replication_probe",
     [string]$Json = "",
-    [int[]]$Ports = @(50262, 50263, 50264, 50265),
+    [int[]]$Ports = @(47800, 47801, 47802, 47803),
     [string]$HostName = "127.0.0.1",
     [string]$OutFile = "",
     [switch]$AllowReplay,

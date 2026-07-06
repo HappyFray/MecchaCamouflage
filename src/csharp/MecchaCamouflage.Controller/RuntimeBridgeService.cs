@@ -9,9 +9,13 @@ namespace MecchaCamouflage.Controller;
 
 public sealed class RuntimeBridgeService
 {
-    public const int BridgePort = 50262;
+    // Ports must stay below 49152: the dynamic range (49152-65535) gets chunks reserved by
+    // Windows/Hyper-V/WSL (netsh interface ipv4 show excludedportrange tcp), where bind() fails
+    // with WSAEACCES (10013). LoadLibrary still succeeds, so injection looks "complete" but the
+    // socket never opens. 50262-50265 landed inside a reserved block; 47800+ stays clear.
+    public const int BridgePort = 47800;
     public static readonly TimeSpan BridgeProbeTimeout = TimeSpan.FromMilliseconds(300);
-    private static readonly int[] BridgePortCandidates = [BridgePort, 50263, 50264, 50265];
+    private static readonly int[] BridgePortCandidates = [BridgePort, 47801, 47802, 47803];
 
     private readonly AppPaths paths;
     private readonly RuntimeLog log;

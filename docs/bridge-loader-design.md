@@ -129,7 +129,7 @@ The config file contains:
   "path": "C:\\...\\runtime-bridge.dll",
   "sha256": "...",
   "buildId": "...",
-  "port": 50262,
+  "port": 47800,
   "progressPath": "C:\\...\\bridge.progress.json",
   "runtimeDir": "C:\\...",
   "logDir": "C:\\..."

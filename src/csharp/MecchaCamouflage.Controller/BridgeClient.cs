@@ -12,7 +12,7 @@ public sealed class BridgeClient
     private readonly int port;
     private readonly TimeSpan? timeout;
 
-    public BridgeClient(string host = "127.0.0.1", int port = 50262, TimeSpan? timeout = null)
+    public BridgeClient(string host = "127.0.0.1", int port = 47800, TimeSpan? timeout = null)
     {
         this.host = host;
         this.port = port;
