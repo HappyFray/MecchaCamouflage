@@ -49,6 +49,7 @@ public sealed class SettingsStore
 
         var paint = settings.Paint;
         paint.StrokeSizeTexels = ReadDouble(root, "stroke_size_texels", paint.StrokeSizeTexels);
+        paint.PackedBatchDelayMs = ReadInt(root, "packed_batch_delay_ms", paint.PackedBatchDelayMs);
         paint.CoverageStepTexels = ReadDouble(root, "coverage_step_texels", paint.CoverageStepTexels);
         paint.SideSourceMaxUv = ReadDouble(root, "side_source_max_uv", paint.SideSourceMaxUv);
         paint.FrontBackSourceMaxUv = ReadDouble(root, "front_back_source_max_uv", paint.FrontBackSourceMaxUv);
@@ -101,6 +102,7 @@ public sealed class SettingsStore
             settings.StopHotkey = "F4";
 
         settings.Paint.StrokeSizeTexels = Math.Clamp(settings.Paint.StrokeSizeTexels, 1.0, 10.0);
+        settings.Paint.PackedBatchDelayMs = Math.Clamp(settings.Paint.PackedBatchDelayMs, 50, 100);
         settings.Paint.CoverageStepTexels = settings.Paint.StrokeSizeTexels;
         settings.Paint.SideSourceMaxUv = Math.Clamp(settings.Paint.SideSourceMaxUv, 0.001, 0.50);
         settings.Paint.FrontBackSourceMaxUv = Math.Clamp(settings.Paint.FrontBackSourceMaxUv, 0.001, 2.00);
@@ -129,6 +131,7 @@ public sealed class SettingsStore
         unpreview_hotkey = settings.UnPreviewHotkey,
         stop_hotkey = settings.StopHotkey,
         stroke_size_texels = settings.Paint.StrokeSizeTexels,
+        packed_batch_delay_ms = settings.Paint.PackedBatchDelayMs,
         coverage_step_texels = settings.Paint.CoverageStepTexels,
         side_source_max_uv = settings.Paint.SideSourceMaxUv,
         front_back_source_max_uv = settings.Paint.FrontBackSourceMaxUv,

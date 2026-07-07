@@ -6,6 +6,7 @@ var tests = new List<(string Name, Action Run)>
 {
     ("legacy false region migrates to fill", LegacyFalseRegionMigratesToFill),
     ("payload includes packed route and fill material", PayloadIncludesPackedRouteAndFillMaterial),
+    ("settings clamp syncs packed batch delay", SettingsClampSyncsPackedBatchDelay),
     ("locales have complete keys", LocalesHaveCompleteKeys),
     ("color parser accepts rrggbb", ColorParserAcceptsHex),
     ("runtime cleanup removes old hash dirs", RuntimeCleanupRemovesOldHashDirs),
@@ -77,6 +78,7 @@ static void LegacyFalseRegionMigratesToFill()
 static void PayloadIncludesPackedRouteAndFillMaterial()
 {
     var settings = new AppSettings();
+    settings.Paint.PackedBatchDelayMs = 88;
     settings.Paint.FrontRegionMode = RegionMode.Fill;
     settings.Paint.SideRegionMode = RegionMode.Skip;
     settings.Paint.BackRegionMode = RegionMode.Paint;
@@ -92,13 +94,13 @@ static void PayloadIncludesPackedRouteAndFillMaterial()
     Assert(tuning.GetProperty("front_region_mode").GetString() == "fill", "front mode missing");
     Assert(tuning.GetProperty("side_region_mode").GetString() == "skip", "side mode missing");
     Assert(tuning.GetProperty("back_region_mode").GetString() == "paint", "back mode missing");
+    Assert(tuning.GetProperty("server_batch_delay_ms").GetInt32() == 88, "server batch delay should be sent");
     Assert(tuning.GetProperty("fill_color").GetString() == "#F11111", "fill color missing");
     Assert(Math.Abs(tuning.GetProperty("fill_color_r").GetDouble() - (241.0 / 255.0)) < 0.00001, "fill red not normalized");
     Assert(tuning.GetProperty("enable_front_paint").GetBoolean() == false, "compat front bool wrong");
     Assert(tuning.GetProperty("enable_back_paint").GetBoolean(), "compat back bool wrong");
     Assert(!tuning.TryGetProperty("adaptive_batch_enabled", out _), "payload should not send legacy adaptive tuning");
     Assert(!tuning.TryGetProperty("server_batch_limit", out _), "payload should not send legacy batch limit tuning");
-    Assert(!tuning.TryGetProperty("server_batch_delay_ms", out _), "payload should not send legacy batch delay tuning");
 }
 
 static void LocalesHaveCompleteKeys()
@@ -363,6 +365,7 @@ static void UiSnapshotHidesLegacyBatchTuning()
 {
     var snapshot = new PaintSnapshot(
         6.0,
+        75,
         6.0,
         false,
         0.0,
@@ -384,6 +387,21 @@ static void UiSnapshotHidesLegacyBatchTuning()
     Assert(!doc.RootElement.TryGetProperty("adaptiveBatching", out _), "snapshot should not expose adaptiveBatching for editing");
     Assert(!doc.RootElement.TryGetProperty("strokeDelayMs", out _), "snapshot should not expose strokeDelayMs for editing");
     Assert(!doc.RootElement.TryGetProperty("batchSize", out _), "snapshot should not expose renamed batchSize");
+}
+
+static void SettingsClampSyncsPackedBatchDelay()
+{
+    var settings = new AppSettings();
+    settings.Paint.PackedBatchDelayMs = 150;
+
+    var clamped = SettingsStore.Clamp(settings);
+
+    Assert(clamped.Paint.PackedBatchDelayMs == 100, "pack batch delay should clamp to max");
+
+    settings.Paint.PackedBatchDelayMs = 12;
+    clamped = SettingsStore.Clamp(settings);
+
+    Assert(clamped.Paint.PackedBatchDelayMs == 50, "pack batch delay should clamp to min");
 }
 
 static void HotkeyValidationRejectsDuplicates()

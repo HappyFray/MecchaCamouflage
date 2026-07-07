@@ -50,9 +50,10 @@ namespace
     constexpr UINT PaintDispatchMessage = WM_APP + 0x4D43;
     constexpr int PackedReplicationDefaultBatchLimit = 50;
     constexpr int PackedReplicationMaxBatchLimit = 50;
-    constexpr int PackedReplicationDefaultPacingMs = 150;
-    constexpr int PackedReplicationMinPacingMs = 150;
+    constexpr int PackedReplicationDefaultPacingMs = 75;
+    constexpr int PackedReplicationMinPacingMs = 50;
     constexpr int PackedReplicationFallbackMaxStrokesPerTick = 24;
+    constexpr int PackedReplicationResolvedPacingMinMs = 1;
     constexpr int PackedReplicationBatchSize = 20;
     constexpr int PackedReplicationFallbackOutgoingBatchesPerSecond = 20;
     constexpr int PackedReplicationMaxPacingMs = 500;
@@ -8333,11 +8334,11 @@ namespace
         }
         if (job->replication_pacing_resolved_pacing_ms > 0)
         {
-            return std::clamp(job->replication_pacing_resolved_pacing_ms, 1, PackedReplicationMaxPacingMs);
+            return std::clamp(job->replication_pacing_resolved_pacing_ms, PackedReplicationResolvedPacingMinMs, PackedReplicationMaxPacingMs);
         }
         const int fallback = static_cast<int>(
             std::ceil(1000.0 / static_cast<double>(std::max(1, PackedReplicationFallbackOutgoingBatchesPerSecond))));
-        return std::clamp(fallback, 1, PackedReplicationMaxPacingMs);
+        return std::clamp(fallback, PackedReplicationResolvedPacingMinMs, PackedReplicationMaxPacingMs);
     }
 
     void mesh_first_update_replication_pacing_resolved_batch(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job,
@@ -8381,8 +8382,9 @@ namespace
 
     auto mesh_first_replication_pacing_clamp_delay(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job, int value) -> int
     {
-        (void)value;
-        return mesh_first_replication_pacing_resolved_pacing(job);
+        const int requested = std::clamp(value, PackedReplicationMinPacingMs, PackedReplicationMaxPacingMs);
+        const int resolved = mesh_first_replication_pacing_resolved_pacing(job);
+        return std::clamp(std::max(requested, resolved), PackedReplicationMinPacingMs, PackedReplicationMaxPacingMs);
     }
 
     void mesh_first_set_replication_pacing_effective(const std::shared_ptr<MeshFirstServerBatchAsyncJob>& job,
@@ -9090,7 +9092,6 @@ namespace
         const bool unpreview_only = json_bool_field(request, "unpreview_only", false);
         const bool normal_paint_requires_packed = !preview_only && !unpreview_only;
         const int packed_server_batch_limit = PackedReplicationBatchSize;
-        const int packed_server_batch_seed_delay_ms = PackedReplicationMinPacingMs;
         const bool research_artifacts = json_bool_field(request, "research_artifacts", false);
         const double tuning_stroke_size_texels = clamp_range(json_number_field(request, "stroke_size_texels", 9.0), 1.0, 12.0);
         const double tuning_coverage_step_texels = clamp_range(json_number_field(request, "coverage_step_texels", 9.0), 1.0, 12.0);
@@ -9107,7 +9108,8 @@ namespace
         const bool tuning_replication_pacing_enabled =
             json_bool_field(request, "replication_pacing_enabled", json_bool_field(request, "adaptive_batch_enabled", true));
         const int tuning_server_batch_limit = json_int_field(request, "server_batch_limit", PackedReplicationDefaultBatchLimit, 1, PackedReplicationMaxBatchLimit);
-        const int tuning_server_batch_delay_ms = json_int_field(request, "server_batch_delay_ms", PackedReplicationDefaultPacingMs, 150, 500);
+        const int tuning_server_batch_delay_ms = json_int_field(request, "server_batch_delay_ms", PackedReplicationDefaultPacingMs, 50, 100);
+        const int packed_server_batch_seed_delay_ms = tuning_server_batch_delay_ms;
         const std::string requested_server_batch_rpc = json_string_field(request, "server_batch_rpc", "");
         const std::string requested_server_batch_rpc_normalized = lower_copy(requested_server_batch_rpc);
         const std::string requested_packed_route = lower_copy(json_string_field(request, "packed_route", "component"));

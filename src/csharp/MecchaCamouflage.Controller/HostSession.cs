@@ -7,11 +7,12 @@ namespace MecchaCamouflage.Controller;
 public sealed class HostSession
 {
     private const int DefaultPackedBatchLimit = 20;
-    private const int DefaultPackedPacingMs = 150;
+    private const int DefaultPackedPacingMs = 75;
 
     private static readonly string[] ResetKeys =
     [
         "paint.brushSizeTexels",
+        "paint.packedBatchDelayMs",
         "paint.coverageStepTexels",
         "paint.autoMaterial",
         "paint.metallic",
@@ -160,6 +161,7 @@ public sealed class HostSession
             case "geometry":
                 next.Paint.StrokeSizeTexels = defaults.Paint.StrokeSizeTexels;
                 next.Paint.CoverageStepTexels = defaults.Paint.StrokeSizeTexels;
+                next.Paint.PackedBatchDelayMs = defaults.Paint.PackedBatchDelayMs;
                 break;
             case "paint.material":
             case "material":
@@ -497,6 +499,7 @@ public sealed class HostSession
         return new SettingsSnapshot(
             new PaintSnapshot(
                 paint.StrokeSizeTexels,
+                paint.PackedBatchDelayMs,
                 paint.CoverageStepTexels,
                 paint.AutoMaterial,
                 paint.Metallic,
@@ -537,8 +540,7 @@ public sealed class HostSession
         return delay >= 0 ? $"{delay}ms" : "-";
     }
 
-    private static string TimingLabel(ProgressSnapshot progress) =>
-        progress.ReplicationPacingEnabled ? "pacing" : "delay";
+    private static string TimingLabel(ProgressSnapshot _) => "delay";
 
     private static int EffectiveBatch(ProgressSnapshot progress)
     {
@@ -578,7 +580,7 @@ public sealed class HostSession
         var map = ResetKeys.ToDictionary(key => key, key => !SettingEquals(settings, defaults, key), StringComparer.OrdinalIgnoreCase);
         var sections = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase)
         {
-            ["paint.geometry"] = map["paint.brushSizeTexels"] || map["paint.coverageStepTexels"],
+            ["paint.geometry"] = map["paint.brushSizeTexels"] || map["paint.coverageStepTexels"] || map["paint.packedBatchDelayMs"],
             ["paint.material"] = map["paint.autoMaterial"] || map["paint.metallic"] || map["paint.roughness"],
             ["regions"] = map["paint.frontRegionMode"] || map["paint.sideRegionMode"] || map["paint.backRegionMode"],
             ["fill.material"] = map["paint.fillColor"] || map["paint.fillMetallic"] || map["paint.fillRoughness"],
@@ -591,6 +593,7 @@ public sealed class HostSession
     private static bool SettingEquals(AppSettings left, AppSettings right, string key) => key switch
     {
         "paint.brushSizeTexels" => Nearly(left.Paint.StrokeSizeTexels, right.Paint.StrokeSizeTexels),
+        "paint.packedBatchDelayMs" => left.Paint.PackedBatchDelayMs == right.Paint.PackedBatchDelayMs,
         "paint.coverageStepTexels" => Nearly(left.Paint.CoverageStepTexels, right.Paint.CoverageStepTexels),
         "paint.autoMaterial" => left.Paint.AutoMaterial == right.Paint.AutoMaterial,
         "paint.metallic" => Nearly(left.Paint.Metallic, right.Paint.Metallic),
@@ -620,7 +623,9 @@ public sealed class HostSession
             case "paint.coverageStepTexels":
                 settings.Paint.StrokeSizeTexels = defaults.Paint.StrokeSizeTexels;
                 settings.Paint.CoverageStepTexels = defaults.Paint.StrokeSizeTexels;
+                settings.Paint.PackedBatchDelayMs = defaults.Paint.PackedBatchDelayMs;
                 break;
+            case "paint.packedBatchDelayMs": settings.Paint.PackedBatchDelayMs = defaults.Paint.PackedBatchDelayMs; break;
             case "paint.autoMaterial": settings.Paint.AutoMaterial = defaults.Paint.AutoMaterial; break;
             case "paint.metallic": settings.Paint.Metallic = defaults.Paint.Metallic; break;
             case "paint.roughness": settings.Paint.Roughness = defaults.Paint.Roughness; break;
@@ -651,6 +656,7 @@ public sealed class HostSession
                 settings.Paint.StrokeSizeTexels = value.GetDouble();
                 settings.Paint.CoverageStepTexels = settings.Paint.StrokeSizeTexels;
                 break;
+            case "paint.packedBatchDelayMs": settings.Paint.PackedBatchDelayMs = value.GetInt32(); break;
             case "paint.autoMaterial": settings.Paint.AutoMaterial = value.GetBoolean(); break;
             case "paint.metallic": settings.Paint.Metallic = value.GetDouble(); break;
             case "paint.roughness": settings.Paint.Roughness = value.GetDouble(); break;

@@ -28,6 +28,7 @@ public static class BridgePayloadBuilder
             ["tuning"] = new Dictionary<string, object?>
             {
                 ["stroke_size_texels"] = paint.StrokeSizeTexels,
+                ["server_batch_delay_ms"] = paint.PackedBatchDelayMs,
                 ["coverage_step_texels"] = paint.CoverageStepTexels,
                 ["side_source_max_uv"] = paint.SideSourceMaxUv,
                 ["front_back_source_max_uv"] = paint.FrontBackSourceMaxUv,
