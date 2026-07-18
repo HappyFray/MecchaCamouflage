@@ -16,8 +16,8 @@ jobs:
 
     - name: Install PowerShell
       run: |
-        apt-get update
-        apt-get install -y pwsh
+        sudo apt-get update
+        sudo apt-get install -y pwsh
 
     - name: Build
       run: make build
