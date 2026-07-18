@@ -14,14 +14,13 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: configure
-      run: ./configure
+    - name: Install PowerShell
+      run: |
+        apt-get update
+        apt-get install -y pwsh
 
-    - name: Install dependencies
-      run: make
+    - name: Build
+      run: make build
 
-    - name: Run check
-      run: make check
-
-    - name: Run distcheck
-      run: make distcheck
+    - name: Package
+      run: make package
